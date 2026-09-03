@@ -1,0 +1,47 @@
+# syntax=docker/dockerfile:1.7
+#
+# Build a prebuilt ROCm profiler library (libgsrocmprof.so) for a given ROCm
+# version/major. Intended to be used with
+# `docker buildx build --platform linux/amd64 --output type=local,...`.
+#
+# Example:
+#   docker buildx build --platform linux/amd64 \
+#     --build-arg ROCM_VERSION=7.2.3 --build-arg ROCM_MAJOR=7 \
+#     -f Dockerfile.rocm --output type=local,dest=dist/rocm .
+#
+# ROCm is amd64 only — there is no ARM GPU target.
+ARG ROCM_VERSION=7.2.3
+# The `-complete` dev image ships rocprofiler-sdk headers + libs (no distro
+# package dance needed). ROCm 7 is the first well-supported rocprofiler-sdk
+# floor (the API stabilized ~6.4); target it first.
+FROM --platform=linux/amd64 rocm/dev-ubuntu-22.04:${ROCM_VERSION}-complete AS builder
+
+ARG ROCM_MAJOR=7
+ARG TARGETARCH
+
+WORKDIR /src
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends g++ make \
+    && rm -rf /var/lib/apt/lists/*
+
+# Only the native sources are needed in the build context.
+COPY Makefile.cupti Makefile.rocm ./
+COPY include/ include/
+COPY src/ src/
+
+# Build the shared library and place it under
+# /out/amd64-rocm<major>/libgsrocmprof.so
+RUN set -eux; \
+    arch_tag="${TARGETARCH:-amd64}"; \
+    if [ "$arch_tag" != "amd64" ]; then \
+      echo "ROCm build targets amd64 only (got $arch_tag)" >&2; exit 2; \
+    fi; \
+    make -f Makefile.rocm rocm \
+      ROCM_PATH=/opt/rocm \
+      ROCM_MAJOR="${ROCM_MAJOR}"; \
+    mkdir -p "/out/${arch_tag}-rocm${ROCM_MAJOR}"; \
+    cp -f "build/libgsrocmprof.so.${ROCM_MAJOR}" "/out/${arch_tag}-rocm${ROCM_MAJOR}/libgsrocmprof.so"
+
+FROM scratch AS out
+COPY --from=builder /out/ /

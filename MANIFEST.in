@@ -1,0 +1,5 @@
+include README.md
+include LICENSE
+include NOTICE
+recursive-include graphsignal/_native *
+recursive-include include *.h

@@ -1,0 +1,50 @@
+# syntax=docker/dockerfile:1.7
+#
+# Build prebuilt CUPTI profiler libraries for a given CUDA version/major.
+# Intended to be used with `docker buildx build --platform ... --output type=local,...`.
+#
+# Example:
+#   docker buildx build --platform linux/amd64,linux/arm64 \
+#     --build-arg CUDA_VERSION=12.4.1 --build-arg CUDA_MAJOR=12 \
+#     -f Dockerfile.cupti --output type=local,dest=dist/cu12 .
+#
+ARG CUDA_VERSION=12.4.1
+# UBI8 base (glibc 2.28, gcc 8.5 -> GLIBCXX_3.4.25) lowers the shipped .so's
+# load floor so it loads on older inference containers (Ubuntu 20.04, RHEL/UBI 8,
+# Debian 11, …). Building on ubuntu22.04 (glibc 2.35, gcc 11) previously forced
+# GLIBC_2.34 + GLIBCXX_3.4.29. The floor is set by the build toolchain, not by
+# link flags (UBI8 ships no static libstdc++, so -static-libstdc++ isn't used).
+FROM --platform=$TARGETPLATFORM nvidia/cuda:${CUDA_VERSION}-devel-ubi8 AS builder
+
+ARG CUDA_MAJOR=12
+ARG TARGETARCH
+
+WORKDIR /src
+
+RUN dnf install -y gcc-c++ make \
+    && dnf clean all
+
+# Only the native sources are needed in the build context.
+COPY Makefile.cupti Makefile.rocm ./
+COPY include/ include/
+COPY src/ src/
+
+# Build the shared library and place it under /out/<arch>-cu<major>/libgscuptiprof.so
+#
+# Note: CUDA devel images usually ship CUPTI under /usr/local/cuda/extras/CUPTI
+# (headers + libs). We point Makefile vars there to avoid distro-dependent packages.
+RUN set -eux; \
+    arch_tag="${TARGETARCH:-}"; \
+    case "$arch_tag" in \
+      amd64|arm64) : ;; \
+      *) echo "Unsupported TARGETARCH: $arch_tag" >&2; exit 2 ;; \
+    esac; \
+    make -f Makefile.cupti cupti \
+      CUDA_HOME=/usr/local/cuda \
+      CUDA_MAJOR="${CUDA_MAJOR}"; \
+    mkdir -p "/out/${arch_tag}-cu${CUDA_MAJOR}"; \
+    cp -f "build/libgscuptiprof.so.${CUDA_MAJOR}" "/out/${arch_tag}-cu${CUDA_MAJOR}/libgscuptiprof.so"
+
+FROM scratch AS out
+COPY --from=builder /out/ /
+

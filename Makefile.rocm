@@ -1,0 +1,268 @@
+SHELL := /usr/bin/env bash
+
+# Build the ROCm profiler shared library (libgsrocmprof.so) used by
+# `graphsignal.profilers.rocm_profiler`.
+#
+# Requirements:
+# - ROCm installed with rocprofiler-sdk (headers + libs), e.g. a
+#   `rocm/dev-ubuntu-*-complete` image or the `rocprofiler-sdk` system package.
+# - Linux/amd64 only (no ARM GPU target for ROCm).
+#
+# Typical usage:
+#   make -f Makefile.rocm rocm ROCM_MAJOR=7
+#   make -f Makefile.rocm rocm-install ROCM_MAJOR=7
+#
+# Tests:
+#   make -f Makefile.rocm test-probe                       # pure C++, no GPU
+#   make -f Makefile.rocm test-common                      # pure C++, no GPU
+#   make -f Makefile.rocm test-rocm-activity ROCM_MAJOR=7 # end-to-end, needs a GPU + ROCm
+#
+# Override ROCM_PATH if needed:
+#   make -f Makefile.rocm rocm ROCM_MAJOR=7 ROCM_PATH=/opt/rocm-7.2.3
+
+# ---------------- Platform ----------------
+UNAME_S := $(shell uname -s)
+UNAME_M := $(shell uname -m)
+
+# ---------------- ROCm ----------------
+ROCM_PATH ?= /opt/rocm
+# ROCm major version used for the build artifacts (e.g. 6, 7).
+# rocprofiler-sdk stabilized around ROCm 6.4; target ROCm 7 first.
+ROCM_MAJOR ?=
+
+ROCM_INCLUDE_DIR ?= $(ROCM_PATH)/include
+# ROCm ships libs under lib (and sometimes lib64); prefer lib.
+ROCM_LIB_DIR ?= $(shell \
+	if [ -d "$(ROCM_PATH)/lib64" ] && ls "$(ROCM_PATH)/lib64"/librocprofiler-sdk.so* >/dev/null 2>&1; then \
+		echo "$(ROCM_PATH)/lib64"; \
+	else \
+		echo "$(ROCM_PATH)/lib"; \
+	fi \
+)
+
+# ---------------- Toolchain ----------------
+CXX ?= g++
+CXXFLAGS ?= -O2 -fPIC -std=c++17
+# __HIP_PLATFORM_AMD__ is REQUIRED: the rocprofiler-sdk headers transitively
+# include the HIP runtime headers, which #error out unless exactly one of
+# __HIP_PLATFORM_AMD__ / __HIP_PLATFORM_NVIDIA__ is defined. hipcc defines it
+# automatically, but we compile with a plain host compiler (g++), so set it here.
+CPPFLAGS ?= -D__HIP_PLATFORM_AMD__ -Iinclude -Isrc/common -I$(ROCM_INCLUDE_DIR)$(if $(ROCM_MAJOR), -DROCM_MAJOR=$(ROCM_MAJOR),)
+
+# ---------------- Build outputs ----------------
+SRC := src/rocm/rocm_activity.cpp
+BUILD_DIR := build
+OUT := $(BUILD_DIR)/libgsrocmprof.so$(if $(ROCM_MAJOR),.$(ROCM_MAJOR),)
+
+# ---------------- Tests ----------------
+# The probe and common (writer) tests are pure C++ (no ROCm headers), so they
+# build and run on any host — no GPU or rocprofiler-sdk required.
+TEST_PROBE_SRC := src/test/probe/probe_test.cpp
+TEST_PROBE_OUT := $(BUILD_DIR)/probe_test
+TEST_COMMON_SRC := src/test/common/common_test.cpp
+TEST_COMMON_OUT := $(BUILD_DIR)/common_test
+TEST_LDFLAGS ?=
+TEST_LDLIBS ?= -pthread
+
+# The rocm_activity test is an end-to-end test: rocprofiler-sdk owns the tool
+# lifecycle via rocprofiler_configure, so it can only be exercised by launching a
+# HIP workload with the built tool library injected. The test binary is PURE HIP
+# (it references no profiler symbol); it is compiled with hipcc and launched with
+# ROCP_TOOL_LIBRARIES pointed at the built libgsrocmprof.so — exactly how
+# RocmProfiler.setup_env_vars injects it in production. Requires a GPU + ROCm.
+HIPCC ?= $(ROCM_PATH)/bin/hipcc
+TEST_ROCM_ACT_SRC := src/test/rocm/rocm_activity_test.cpp
+TEST_ROCM_ACT_OUT := $(BUILD_DIR)/rocm_activity_test
+# -rdynamic: the test registers a <graphsignal/probe.h> HOST probe in the main
+# executable; the injected profiler discovers the registry via
+# dlsym(RTLD_DEFAULT), which requires the executable's dynamic symbols exported.
+TEST_ROCM_ACT_FLAGS ?= -O2 -std=c++17 -Iinclude -rdynamic
+
+# -z nodelete: never unload this DSO. rocprofiler-sdk holds our callback pointers
+# for the whole process lifetime; unmapping the tool library while callbacks are
+# still registered would dangle them (SIGSEGV). Mirrors the CUPTI backend.
+LDFLAGS ?= -shared -Wl,-z,nodelete
+LDLIBS ?= -L$(ROCM_LIB_DIR) -lrocprofiler-sdk -ldl -pthread
+
+# ---------------- Packaging ----------------
+# The built .so ships in the wheel (committed under graphsignal/_native/);
+# install / buildx-install copy the artifact there.
+PROFILER_NATIVE_DIR ?= ./graphsignal/_native
+PKG_NATIVE_DIR := $(PROFILER_NATIVE_DIR)
+# amd64 only — there is no ARM GPU target for ROCm.
+PKG_ARCH := amd64
+PKG_OUT_DIR := $(PKG_NATIVE_DIR)/$(PKG_ARCH)-rocm$(ROCM_MAJOR)
+PKG_OUT := $(PKG_OUT_DIR)/libgsrocmprof.so
+
+# ---------------- Docker buildx (prebuilt artifacts) ----------------
+#
+# Builds a precompiled Linux/amd64 library for a given ROCm major using Docker
+# buildx. No GPU is required to *build*.
+#
+# Output layout:
+#   dist/rocm/amd64-rocm<major>/libgsrocmprof.so
+#
+BUILDX_PLATFORMS ?= linux/amd64
+BUILDX_BUILDER ?= graphsignal-builder
+BUILDX_OUT_DIR ?= dist/rocm
+ROCM7_VERSION ?= 7.2.3
+
+.PHONY: all rocm rocm-install test test-probe test-common test-rocm-activity clean distclean info \
+	buildx-setup rocm-buildx rocm-buildx-rocm7 rocm-buildx-install
+
+all: rocm
+
+test: test-probe test-common test-rocm-activity
+
+info:
+	@echo "UNAME_S=$(UNAME_S)"
+	@echo "UNAME_M=$(UNAME_M)"
+	@echo "ROCM_PATH=$(ROCM_PATH)"
+	@echo "ROCM_MAJOR=$(ROCM_MAJOR)"
+	@echo "ROCM_INCLUDE_DIR=$(ROCM_INCLUDE_DIR)"
+	@echo "ROCM_LIB_DIR=$(ROCM_LIB_DIR)"
+	@echo "PKG_ARCH=$(PKG_ARCH)"
+	@echo "PKG_OUT=$(PKG_OUT)"
+	@echo "BUILDX_PLATFORMS=$(BUILDX_PLATFORMS)"
+	@echo "BUILDX_BUILDER=$(BUILDX_BUILDER)"
+	@echo "BUILDX_OUT_DIR=$(BUILDX_OUT_DIR)"
+	@echo "ROCM7_VERSION=$(ROCM7_VERSION)"
+	@echo "CXX=$(CXX)"
+	@echo "CXXFLAGS=$(CXXFLAGS)"
+	@echo "CPPFLAGS=$(CPPFLAGS)"
+	@echo "LDFLAGS=$(LDFLAGS)"
+	@echo "LDLIBS=$(LDLIBS)"
+
+$(BUILD_DIR):
+	@mkdir -p "$(BUILD_DIR)"
+
+# ---------------- Build / install ----------------
+rocm: $(OUT)
+
+$(OUT): $(SRC) | $(BUILD_DIR)
+	@if [[ "$(UNAME_S)" == "Darwin" ]]; then \
+		echo "ROCm build is not supported on macOS (ROCm is Linux only)."; \
+		exit 1; \
+	fi
+	@if [[ "$(UNAME_M)" != "x86_64" ]]; then \
+		echo "ROCm build targets linux/amd64 only (got $(UNAME_M))."; \
+		exit 1; \
+	fi
+	@if [[ -z "$(ROCM_MAJOR)" ]]; then \
+		echo "Error: ROCM_MAJOR is required (e.g. make -f Makefile.rocm rocm ROCM_MAJOR=7 ROCM_PATH=/opt/rocm)"; \
+		exit 1; \
+	fi
+	@echo "Building $@"
+	$(CXX) $(CXXFLAGS) $(CPPFLAGS) $(LDFLAGS) -o "$@" $(SRC) $(LDLIBS)
+
+rocm-install: $(OUT)
+	@if [[ -z "$(ROCM_MAJOR)" ]]; then \
+		echo "Error: ROCM_MAJOR is required (e.g. make -f Makefile.rocm rocm-install ROCM_MAJOR=7)"; \
+		exit 1; \
+	fi
+	@mkdir -p "$(PKG_OUT_DIR)"
+	@cp -f "$(OUT)" "$(PKG_OUT)"
+	@echo "Installed: $(PKG_OUT)"
+	@echo "Note: runtime still requires librocprofiler-sdk.so to be discoverable (e.g. set LD_LIBRARY_PATH to $(ROCM_LIB_DIR))."
+
+# ---------------- Docker buildx ----------------
+buildx-setup:
+	@docker buildx inspect "$(BUILDX_BUILDER)" >/dev/null 2>&1 && docker buildx use "$(BUILDX_BUILDER)" >/dev/null 2>&1 || \
+		docker buildx create --name "$(BUILDX_BUILDER)" --driver docker-container --use >/dev/null
+	@docker buildx inspect --bootstrap >/dev/null
+	@echo "buildx is ready"
+
+rocm-buildx: rocm-buildx-rocm7
+
+rocm-buildx-rocm7:
+	@mkdir -p "$(BUILDX_OUT_DIR)"
+	docker buildx build \
+		--builder "$(BUILDX_BUILDER)" \
+		--platform "$(BUILDX_PLATFORMS)" \
+		--build-arg ROCM_VERSION="$(ROCM7_VERSION)" \
+		--build-arg ROCM_MAJOR=7 \
+		-f Dockerfile.rocm \
+		--output type=local,dest="$(BUILDX_OUT_DIR)" \
+		.
+
+rocm-buildx-install:
+	@set -euo pipefail; \
+	shopt -s nullglob; \
+	paths=( \
+		"$(BUILDX_OUT_DIR)"/*-rocm*/libgsrocmprof.so \
+		"$(BUILDX_OUT_DIR)"/linux_*/*-rocm*/libgsrocmprof.so \
+	); \
+	real_paths=(); \
+	for p in "$${paths[@]}"; do \
+		[[ -f "$$p" ]] && real_paths+=( "$$p" ); \
+	done; \
+	paths=( "$${real_paths[@]}" ); \
+	if (( $${#paths[@]} == 0 )); then \
+		echo "No buildx artifacts found under $(BUILDX_OUT_DIR)/<arch>-rocm<major>/libgsrocmprof.so"; \
+		echo "Run: make -f Makefile.rocm rocm-buildx"; \
+		exit 1; \
+	fi; \
+	for p in "$${paths[@]}"; do \
+		d="$$(basename "$$(dirname "$$p")")"; \
+		mkdir -p "$(PKG_NATIVE_DIR)/$$d"; \
+		cp -f "$$p" "$(PKG_NATIVE_DIR)/$$d/libgsrocmprof.so"; \
+		echo "Installed: $(PKG_NATIVE_DIR)/$$d/libgsrocmprof.so"; \
+	done
+
+# ---------------- Tests ----------------
+test-probe: $(TEST_PROBE_OUT)
+	@echo "Running test: $(TEST_PROBE_OUT)"
+	@./$(TEST_PROBE_OUT)
+
+$(TEST_PROBE_OUT): $(TEST_PROBE_SRC) | $(BUILD_DIR)
+	@echo "Building test: $@"
+	$(CXX) $(CXXFLAGS) -Iinclude $(TEST_LDFLAGS) -o "$@" $(TEST_PROBE_SRC) $(TEST_LDLIBS)
+
+test-common: $(TEST_COMMON_OUT)
+	@echo "Running test: $(TEST_COMMON_OUT)"
+	@./$(TEST_COMMON_OUT)
+
+$(TEST_COMMON_OUT): $(TEST_COMMON_SRC) | $(BUILD_DIR)
+	@echo "Building test: $@"
+	$(CXX) $(CXXFLAGS) -Iinclude -Isrc/common $(TEST_LDFLAGS) -o "$@" $(TEST_COMMON_SRC) $(TEST_LDLIBS)
+
+# End-to-end: build the tool .so + a pure-HIP workload binary, then run the
+# workload with the tool injected via ROCP_TOOL_LIBRARIES (mirrors production).
+# Skips cleanly when hipcc, rocprofiler-sdk, or a GPU are unavailable.
+test-rocm-activity:
+	@bash -e -c '\
+		if [[ "$(UNAME_S)" == "Darwin" ]]; then \
+			echo "Skipping rocm_activity test (ROCm is Linux only)."; \
+			exit 0; \
+		fi; \
+		if [[ ! -x "$(HIPCC)" ]] && ! command -v hipcc >/dev/null 2>&1; then \
+			echo "Skipping rocm_activity test: hipcc not found (set HIPCC or ROCM_PATH)."; \
+			exit 0; \
+		fi; \
+		if [[ ! -f "$(ROCM_LIB_DIR)/librocprofiler-sdk.so" ]] && ! ls "$(ROCM_LIB_DIR)"/librocprofiler-sdk.so* >/dev/null 2>&1; then \
+			echo "Skipping rocm_activity test: librocprofiler-sdk.so not found under $(ROCM_LIB_DIR)."; \
+			echo "Install the rocprofiler-sdk system package (ships with ROCm) or set ROCM_PATH."; \
+			exit 0; \
+		fi; \
+		if [[ -z "$(ROCM_MAJOR)" ]]; then \
+			echo "Skipping rocm_activity test: ROCM_MAJOR is required to build the tool library"; \
+			echo "(e.g. make -f Makefile.rocm test-rocm-activity ROCM_MAJOR=7)."; \
+			exit 0; \
+		fi; \
+		hipcc_bin="$(HIPCC)"; [[ -x "$$hipcc_bin" ]] || hipcc_bin="hipcc"; \
+		$(MAKE) -f Makefile.rocm $(OUT) ROCM_MAJOR=$(ROCM_MAJOR) ROCM_PATH=$(ROCM_PATH); \
+		echo "Building test with hipcc: $(TEST_ROCM_ACT_OUT)"; \
+		"$$hipcc_bin" $(TEST_ROCM_ACT_FLAGS) -o "$(TEST_ROCM_ACT_OUT)" $(TEST_ROCM_ACT_SRC); \
+		echo "Running test: $(TEST_ROCM_ACT_OUT) (tool injected via ROCP_TOOL_LIBRARIES)"; \
+		ROCP_TOOL_LIBRARIES="$$(cd "$$(dirname "$(OUT)")" && pwd)/$$(basename "$(OUT)")" \
+		LD_LIBRARY_PATH="$(ROCM_LIB_DIR):$${LD_LIBRARY_PATH:-}" \
+		GRAPHSIGNAL_DEBUG=1 \
+			./$(TEST_ROCM_ACT_OUT); \
+	'
+
+# ---------------- Clean ----------------
+clean:
+	@rm -rf "$(BUILD_DIR)"
+
+distclean: clean
+	@rm -f "$(PKG_OUT)"
