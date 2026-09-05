@@ -1,24 +1,65 @@
 name: Publish to PyPI
 
+# TAGS ONLY, and deliberately no `workflow_dispatch`. A manual run can be
+# started from any ref, which would publish whatever `main` happened to point at
+# under whatever version pyproject.toml happened to carry. Re-running a failed
+# release is still possible: re-run the jobs on the tag's own workflow run.
+#
+# `v*` rather than `*`: a tag is not automatically a release. Anything else —
+# a marker, a branch point, an experiment — must not reach PyPI.
 on:
-  workflow_dispatch:
   push:
     tags:
-      - '*'
+      - 'v*'
 
 jobs:
   build-and-publish:
     runs-on: ubuntu-latest
     steps:
-      - name: Check out code
+      - name: Check out the tagged commit
         uses: actions/checkout@v4
-        with:
-          ref: 'main'
-      
+        # Deliberately NO `ref: main`. This job is triggered BY a tag, and
+        # checking out a branch publishes whatever main points at when the
+        # runner starts — which is not what was tagged, reviewed, or announced.
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
+
+      - name: Check the tag against both places the version is written
+        # The version lives in pyproject.toml AND graphsignal/version.py, and
+        # `__version__` is what the profiler reports to /signals and sends to
+        # the version check. A tag disagreeing with either makes the release
+        # mean two different things.
+        run: |
+          tag_version="${GITHUB_REF_NAME#v}"
+          pkg_version="$(python -c "import tomllib;print(tomllib.load(open('pyproject.toml','rb'))['tool']['poetry']['version'])")"
+          mod_version="$(python -c "import re;print(re.search(r\"__version__ = '([^']+)'\", open('graphsignal/version.py').read()).group(1))")"
+
+          status=0
+          if [ "$tag_version" != "$pkg_version" ]; then
+            echo "::error::tag ${GITHUB_REF_NAME} does not match pyproject.toml version ${pkg_version}"
+            status=1
+          fi
+          if [ "$tag_version" != "$mod_version" ]; then
+            echo "::error::tag ${GITHUB_REF_NAME} does not match graphsignal/version.py ${mod_version}"
+            status=1
+          fi
+          exit $status
+
+      - name: Refuse to republish a released version
+        # PyPI is immutable and would reject the upload anyway — this only
+        # moves that failure to the front, before a build and a test run, and
+        # gives it an error somebody can act on.
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          code="$(curl -s -o /dev/null -w '%{http_code}' "https://pypi.org/pypi/graphsignal/${version}/json")"
+          if [ "$code" = "200" ]; then
+            echo "::error::graphsignal ${version} is already on PyPI. Releasing again needs a new version:"
+            echo "::error::bump pyproject.toml and graphsignal/version.py, commit, and tag that."
+            exit 1
+          fi
 
       - name: Install pip tools
         run: python -m pip install --upgrade pip setuptools wheel
@@ -27,19 +68,50 @@ jobs:
         uses: snok/install-poetry@v1
 
       - name: Install dependencies
+        # NO `poetry update` here, deliberately. It resolves the newest
+        # dependencies at release time, so the tests below would gate the
+        # release against a set nobody has reviewed, and the artifact would be
+        # built against a lockfile mutated on a runner and thrown away. Catching
+        # dependency drift is daily-tests.yml's job, on its own schedule, where
+        # a break is a signal rather than a blocked release.
         run: poetry install
-
-      - name: Update dependencies
-        run: poetry update
 
       - name: Run unit tests
         run: poetry run python -m scripts.test_local
 
-      - name: Publish package to PyPI
+      - name: Build the distributions
+        run: poetry build
+
+      - name: Check the wheel carries the prebuilt native libraries
+        # The CUPTI and ROCm injection libraries are committed under
+        # graphsignal/_native/ and shipped by pyproject's `include`. A wheel
+        # without them installs cleanly, runs cleanly, and profiles no GPU at
+        # all — the failure is silent and only visible on a GPU box, so it is
+        # checked here rather than discovered there.
+        # Done entirely in Python: finding the wheel through `ls` makes the
+        # check depend on that command's output format, which differs between
+        # a developer's shell and the runner's.
+        run: |
+          python - <<'CHECK'
+          import glob, sys, zipfile
+
+          wheels = glob.glob('dist/*.whl')
+          if len(wheels) != 1:
+              sys.exit(f'::error::expected exactly one wheel in dist/, found {wheels}')
+
+          names = sorted(
+              n for n in zipfile.ZipFile(wheels[0]).namelist()
+              if n.startswith('graphsignal/_native/') and n.endswith('.so')
+          )
+          print(f'{wheels[0]} carries {len(names)} native libraries:')
+          for name in names:
+              print(' ', name)
+
+          if len(names) < 5:
+              sys.exit(f'::error::expected 5 native libraries, found {len(names)}')
+          CHECK
+
+      - name: Publish to PyPI
         env:
           POETRY_PYPI_TOKEN_PYPI: ${{ secrets.PYPI_API_TOKEN }}
-        run: poetry publish --build
-
-      - name: Clean up
-        if: always()
-        run: rm -rf dist
+        run: poetry publish

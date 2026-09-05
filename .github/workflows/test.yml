@@ -1,0 +1,50 @@
+name: Test
+
+# On commits, not on a clock. A scheduled run that resolves fresh dependencies
+# reports breakage nobody caused, at a time nobody is looking, and says nothing
+# about the change in front of you. What gates a merge is what this repository
+# does to its own code.
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  python:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # The floor and the ceiling. pyproject allows >=3.9, but the suite uses
+        # unittest.assertNoLogs, which arrives in 3.10 — see the note in the
+        # README of this workflow's companion job below.
+        python-version: ['3.10', '3.13']
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install Poetry
+        uses: snok/install-poetry@v1
+
+      # `install`, never `update`: the lockfile is what a release is built
+      # against, so it is what CI must test.
+      - name: Install dependencies
+        run: poetry install
+
+      - name: Run the Python suite
+        run: poetry run python -m scripts.test_local
+
+  # The probe header is public API — it is vendored into other people's builds,
+  # and its ABI is a contract with libraries compiled against an older copy.
+  # These two suites need a compiler and no GPU, so they belong on every commit
+  # rather than only on the GPU box.
+  native:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Probe header and writer tests
+        run: make -f Makefile.cupti test-probe test-common
