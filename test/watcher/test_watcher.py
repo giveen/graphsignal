@@ -94,19 +94,20 @@ class WatcherConfigureTest(unittest.TestCase):
         watcher = self._configure()
         watcher.set_gauge('g1', 1.5, measurement_ts=10)
         watcher.set_counter('c1', 3, measurement_ts=10)
-        watcher.set_summary('s1', count=2, sum_val=4.0, sum2_val=10.0,
-                            measurement_ts=10)
+        watcher.set_histogram('s1', count=2, sum_val=4.0, measurement_ts=10)
         watcher.set_histogram('h1', bins=[1, 3], counts=[1, 1],
-                              measurement_ts=10)
+                              measurement_ts=10, count=2, sum_val=4.0,
+                              min_val=1, max_val=3)
         watcher.set_profile('p1', frames={'f1': 5.0}, samples={'f1': 1}, measurement_ts=10)
 
         exported = {m.name: m for m in watcher.metric_store().export()}
         self.assertEqual(exported['g1'].datapoint, {'ts': 10, 'value': 1.5})
         self.assertEqual(exported['c1'].datapoint, {'ts': 10, 'total': 3})
         self.assertEqual(exported['s1'].datapoint,
-                         {'ts': 10, 'count': 2, 'sum': 4.0, 'sum2': 10.0})
+                         {'ts': 10, 'count': 2, 'sum': 4.0})
         self.assertEqual(exported['h1'].datapoint,
-                         {'ts': 10, 'bins': [1, 3], 'counts': [1, 1]})
+                         {'ts': 10, 'bins': [1, 3], 'counts': [1, 1],
+                          'count': 2, 'sum': 4.0, 'min': 1, 'max': 3})
         self.assertEqual(exported['p1'].datapoint,
                          {'ts': 10, 'frames': {'f1': 5}, 'samples': {'f1': 1}})
 

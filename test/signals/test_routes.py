@@ -73,24 +73,34 @@ class BuildPayloadTest(unittest.TestCase):
         self.assertEqual(record['stats'], {'total': 142})
         self.assertEqual(record['updated_ns'], 2000)
 
-    def test_summary_stats(self):
-        self.watcher.set_summary('s1', count=4, sum_val=95.0, sum2_val=100.0,
-                                 measurement_ts=3000)
+    def test_histogram_stats_without_bins(self):
+        # A Prometheus summary: exact totals, no buckets. mean is exact;
+        # quantiles have no bins to come from and stay null.
+        self.watcher.set_histogram('s1', count=4, sum_val=95.0,
+                                   min_val=1.5, max_val=60.0,
+                                   measurement_ts=3000)
 
         record = self._get_metric(build_payload(), 's1')
-        self.assertEqual(record['type'], 'summary')
+        self.assertEqual(record['type'], 'histogram')
         self.assertEqual(record['updated_ns'], 3000)
-        self.assertEqual(record['stats'],
-                         {'count': 4, 'sum': 95.0, 'avg': 23.75})
+        self.assertEqual(record['stats'], {
+            'count': 4,
+            'sum': 95.0,
+            'min': 1.5,
+            'max': 60.0,
+            'mean': 23.75,
+            'p50': None,
+            'p95': None,
+        })
 
-    def test_summary_stats_zero_count_avg_is_null(self):
-        self.watcher.set_summary('s1', count=0, sum_val=0.0,
-                                 measurement_ts=3000)
+    def test_histogram_stats_zero_count_mean_is_null(self):
+        self.watcher.set_histogram('s1', count=0, sum_val=0.0,
+                                   measurement_ts=3000)
 
         stats = self._get_metric(build_payload(), 's1')['stats']
         self.assertEqual(stats['count'], 0)
         self.assertEqual(stats['sum'], 0.0)
-        self.assertIsNone(stats['avg'])
+        self.assertIsNone(stats['mean'])
 
     def test_histogram_stats_mean_and_quantiles(self):
         self.watcher.set_histogram('h1', bins=[5, 20, 50], counts=[1, 2, 1],
@@ -99,12 +109,32 @@ class BuildPayloadTest(unittest.TestCase):
         record = self._get_metric(build_payload(), 'h1')
         self.assertEqual(record['type'], 'histogram')
         self.assertEqual(record['updated_ns'], 3000)
-        # mean = (5*1 + 20*2 + 50*1) / 4 = 23.75; nearest-rank quantiles.
+        # mean = (5*1 + 20*2 + 50*1) / 4 = 23.75; nearest-rank quantiles;
+        # no exact aggregates supplied -> null (not measured).
         self.assertEqual(record['stats'], {
+            'count': None,
+            'sum': None,
+            'min': None,
+            'max': None,
             'mean': 23.75,
             'p50': 20,
             'p95': 50,
         })
+
+    def test_histogram_stats_exact_aggregates(self):
+        # Bins say 4 values in [5, 20, 20, 50]; the writer's exact aggregates
+        # say the true values summed to 101 -> mean 25.25, not the bin mean.
+        self.watcher.set_histogram('h2', bins=[5, 20, 50], counts=[1, 2, 1],
+                                   measurement_ts=3000, count=4, sum_val=101,
+                                   min_val=6, max_val=59)
+        stats = self._get_metric(build_payload(), 'h2')['stats']
+        self.assertEqual(stats['count'], 4)
+        self.assertEqual(stats['sum'], 101)
+        self.assertEqual(stats['min'], 6)
+        self.assertEqual(stats['max'], 59)
+        self.assertEqual(stats['mean'], 25.25)
+        self.assertEqual(stats['p50'], 20)
+        self.assertEqual(stats['p95'], 50)
 
     def test_profile_stats_frames_sorted_by_value_desc(self):
         self.watcher.set_profile('p1', frames={'b': 7, 'a': 100, 'c': 50},
@@ -122,8 +152,7 @@ class BuildPayloadTest(unittest.TestCase):
         ]})
 
     def test_metric_records_sorted_by_name_type_tags(self):
-        self.watcher.set_summary('m1', count=1, sum_val=1.0,
-                                 measurement_ts=1000, tags={'t1': '1'})
+        self.watcher.set_counter('m1', 1, measurement_ts=1000, tags={'t1': '1'})
         self.watcher.set_histogram('m1', bins=[1], counts=[1],
                                    measurement_ts=1000, tags={'t1': '1'})
         self.watcher.set_gauge('a1', 1.0, measurement_ts=1000, tags={'t1': 'b'})
@@ -136,7 +165,7 @@ class BuildPayloadTest(unittest.TestCase):
                        for r in build_payload()['metrics']]
         self.assertEqual(names_types, [
             ('a1', 'gauge'), ('a1', 'gauge'),
-            ('m1', 'histogram'), ('m1', 'summary')])
+            ('m1', 'counter'), ('m1', 'histogram')])
 
     def test_errors_section(self):
         self.watcher.log_message('something broke', level='error',

@@ -24,7 +24,7 @@ _sym_db = _symbol_database.Default()
 
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\rsignals.proto\x12\x13graphsignal.signals\"\xb6\x01\n\rUploadRequest\x12,\n\x07metrics\x18\x01 \x03(\x0b\x32\x1b.graphsignal.signals.Metric\x12\x32\n\x0blog_batches\x18\x02 \x03(\x0b\x32\x1d.graphsignal.signals.LogBatch\x12\x30\n\tresources\x18\x03 \x03(\x0b\x32\x1d.graphsignal.signals.Resource\x12\x11\n\tupload_ts\x18\x04 \x01(\x03\"\x10\n\x0eUploadResponse\"!\n\x03Tag\x12\x0b\n\x03key\x18\x01 \x01(\t\x12\r\n\x05value\x18\x02 \x01(\t\"\xf7\x02\n\x06Metric\x12\x11\n\tmetric_id\x18\x01 \x01(\t\x12\x0c\n\x04name\x18\x02 \x01(\t\x12&\n\x04tags\x18\x03 \x03(\x0b\x32\x18.graphsignal.signals.Tag\x12\x34\n\x04type\x18\x04 \x01(\x0e\x32&.graphsignal.signals.Metric.MetricType\x12\x32\n\ndatapoints\x18\x05 \x03(\x0b\x32\x1e.graphsignal.signals.DataPoint\x12\x31\n\x06\x66rames\x18\x06 \x03(\x0b\x32!.graphsignal.signals.ProfileFrame\"\x86\x01\n\nMetricType\x12\x14\n\x10UNDEFINED_METRIC\x10\x00\x12\x10\n\x0cGAUGE_METRIC\x10\x01\x12\x12\n\x0e\x43OUNTER_METRIC\x10\x02\x12\x12\n\x0eSUMMARY_METRIC\x10\x03\x12\x14\n\x10HISTOGRAM_METRIC\x10\x04\x12\x12\n\x0ePROFILE_METRIC\x10\x05\"\xa2\x03\n\tDataPoint\x12\x0f\n\x05gauge\x18\x01 \x01(\x01H\x00\x12\x0f\n\x05total\x18\x02 \x01(\x01H\x00\x12\x39\n\x07summary\x18\x03 \x01(\x0b\x32&.graphsignal.signals.DataPoint.SummaryH\x00\x12=\n\thistogram\x18\x04 \x01(\x0b\x32(.graphsignal.signals.DataPoint.HistogramH\x00\x12\x39\n\x07profile\x18\x05 \x01(\x0b\x32&.graphsignal.signals.DataPoint.ProfileH\x00\x12\x16\n\x0emeasurement_ts\x18\n \x01(\x03\x1a\x33\n\x07Summary\x12\r\n\x05\x63ount\x18\x01 \x01(\x03\x12\x0b\n\x03sum\x18\x02 \x01(\x01\x12\x0c\n\x04sum2\x18\x03 \x01(\x01\x1a)\n\tHistogram\x12\x0c\n\x04\x62ins\x18\x01 \x03(\x01\x12\x0e\n\x06\x63ounts\x18\x02 \x03(\x03\x1a=\n\x07Profile\x12\x11\n\tframe_ids\x18\x01 \x03(\x04\x12\x0e\n\x06values\x18\x02 \x03(\x04\x12\x0f\n\x07samples\x18\x03 \x03(\x04\x42\x07\n\x05value\".\n\x0cProfileFrame\x12\x10\n\x08\x66rame_id\x18\x01 \x01(\x04\x12\x0c\n\x04name\x18\x02 \x01(\t\"f\n\x08LogBatch\x12&\n\x04tags\x18\x01 \x03(\x0b\x32\x18.graphsignal.signals.Tag\x12\x32\n\x0blog_entries\x18\x02 \x03(\x0b\x32\x1d.graphsignal.signals.LogEntry\"\x95\x02\n\x08LogEntry\x12\x10\n\x08\x65ntry_ts\x18\x01 \x01(\t\x12\x35\n\x05level\x18\x02 \x01(\x0e\x32&.graphsignal.signals.LogEntry.LogLevel\x12\x0f\n\x07message\x18\x03 \x01(\t\x12\x11\n\texception\x18\x04 \x01(\t\x12\x0e\n\x06log_ts\x18\x05 \x01(\x03\"\x8b\x01\n\x08LogLevel\x12\x15\n\x11UNSPECIFIED_LEVEL\x10\x00\x12\x0f\n\x0bTRACE_LEVEL\x10\x05\x12\x0f\n\x0b\x44\x45\x42UG_LEVEL\x10\n\x12\x0e\n\nINFO_LEVEL\x10\x14\x12\x11\n\rWARNING_LEVEL\x10\x1e\x12\x0f\n\x0b\x45RROR_LEVEL\x10(\x12\x12\n\x0e\x43RITICAL_LEVEL\x10\x32\"\xb6\x01\n\x08Resource\x12\x13\n\x0bresource_id\x18\x01 \x01(\t\x12\x0c\n\x04kind\x18\x02 \x01(\t\x12&\n\x04tags\x18\x03 \x03(\x0b\x32\x18.graphsignal.signals.Tag\x12\x32\n\nattributes\x18\x04 \x03(\x0b\x32\x1e.graphsignal.signals.Attribute\x12\x15\n\rfirst_seen_ts\x18\x05 \x01(\x03\x12\x14\n\x0clast_seen_ts\x18\x06 \x01(\x03\"(\n\tAttribute\x12\x0c\n\x04name\x18\x01 \x01(\t\x12\r\n\x05value\x18\x02 \x01(\tb\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\rsignals.proto\x12\x13graphsignal.signals\"\xb6\x01\n\rUploadRequest\x12,\n\x07metrics\x18\x01 \x03(\x0b\x32\x1b.graphsignal.signals.Metric\x12\x32\n\x0blog_batches\x18\x02 \x03(\x0b\x32\x1d.graphsignal.signals.LogBatch\x12\x30\n\tresources\x18\x03 \x03(\x0b\x32\x1d.graphsignal.signals.Resource\x12\x11\n\tupload_ts\x18\x04 \x01(\x03\"\x10\n\x0eUploadResponse\"!\n\x03Tag\x12\x0b\n\x03key\x18\x01 \x01(\t\x12\r\n\x05value\x18\x02 \x01(\t\"\xe8\x02\n\x06Metric\x12\x11\n\tmetric_id\x18\x01 \x01(\t\x12\x0c\n\x04name\x18\x02 \x01(\t\x12&\n\x04tags\x18\x03 \x03(\x0b\x32\x18.graphsignal.signals.Tag\x12\x34\n\x04type\x18\x04 \x01(\x0e\x32&.graphsignal.signals.Metric.MetricType\x12\x32\n\ndatapoints\x18\x05 \x03(\x0b\x32\x1e.graphsignal.signals.DataPoint\x12\x31\n\x06\x66rames\x18\x06 \x03(\x0b\x32!.graphsignal.signals.ProfileFrame\"x\n\nMetricType\x12\x14\n\x10UNDEFINED_METRIC\x10\x00\x12\x10\n\x0cGAUGE_METRIC\x10\x01\x12\x12\n\x0e\x43OUNTER_METRIC\x10\x02\x12\x14\n\x10HISTOGRAM_METRIC\x10\x04\x12\x12\n\x0ePROFILE_METRIC\x10\x05\"\x04\x08\x03\x10\x03\"\xa5\x03\n\tDataPoint\x12\x0f\n\x05gauge\x18\x01 \x01(\x01H\x00\x12\x0f\n\x05total\x18\x02 \x01(\x01H\x00\x12=\n\thistogram\x18\x04 \x01(\x0b\x32(.graphsignal.signals.DataPoint.HistogramH\x00\x12\x39\n\x07profile\x18\x05 \x01(\x0b\x32&.graphsignal.signals.DataPoint.ProfileH\x00\x12\x16\n\x0emeasurement_ts\x18\n \x01(\x03\x1a\x95\x01\n\tHistogram\x12\x0c\n\x04\x62ins\x18\x01 \x03(\x01\x12\x0e\n\x06\x63ounts\x18\x02 \x03(\x03\x12\x12\n\x05\x63ount\x18\x03 \x01(\x03H\x00\x88\x01\x01\x12\x10\n\x03sum\x18\x04 \x01(\x01H\x01\x88\x01\x01\x12\x10\n\x03min\x18\x05 \x01(\x01H\x02\x88\x01\x01\x12\x10\n\x03max\x18\x06 \x01(\x01H\x03\x88\x01\x01\x42\x08\n\x06_countB\x06\n\x04_sumB\x06\n\x04_minB\x06\n\x04_max\x1a=\n\x07Profile\x12\x11\n\tframe_ids\x18\x01 \x03(\x04\x12\x0e\n\x06values\x18\x02 \x03(\x04\x12\x0f\n\x07samples\x18\x03 \x03(\x04\x42\x07\n\x05valueJ\x04\x08\x03\x10\x04\".\n\x0cProfileFrame\x12\x10\n\x08\x66rame_id\x18\x01 \x01(\x04\x12\x0c\n\x04name\x18\x02 \x01(\t\"f\n\x08LogBatch\x12&\n\x04tags\x18\x01 \x03(\x0b\x32\x18.graphsignal.signals.Tag\x12\x32\n\x0blog_entries\x18\x02 \x03(\x0b\x32\x1d.graphsignal.signals.LogEntry\"\x95\x02\n\x08LogEntry\x12\x10\n\x08\x65ntry_ts\x18\x01 \x01(\t\x12\x35\n\x05level\x18\x02 \x01(\x0e\x32&.graphsignal.signals.LogEntry.LogLevel\x12\x0f\n\x07message\x18\x03 \x01(\t\x12\x11\n\texception\x18\x04 \x01(\t\x12\x0e\n\x06log_ts\x18\x05 \x01(\x03\"\x8b\x01\n\x08LogLevel\x12\x15\n\x11UNSPECIFIED_LEVEL\x10\x00\x12\x0f\n\x0bTRACE_LEVEL\x10\x05\x12\x0f\n\x0b\x44\x45\x42UG_LEVEL\x10\n\x12\x0e\n\nINFO_LEVEL\x10\x14\x12\x11\n\rWARNING_LEVEL\x10\x1e\x12\x0f\n\x0b\x45RROR_LEVEL\x10(\x12\x12\n\x0e\x43RITICAL_LEVEL\x10\x32\"\xb6\x01\n\x08Resource\x12\x13\n\x0bresource_id\x18\x01 \x01(\t\x12\x0c\n\x04kind\x18\x02 \x01(\t\x12&\n\x04tags\x18\x03 \x03(\x0b\x32\x18.graphsignal.signals.Tag\x12\x32\n\nattributes\x18\x04 \x03(\x0b\x32\x1e.graphsignal.signals.Attribute\x12\x15\n\rfirst_seen_ts\x18\x05 \x01(\x03\x12\x14\n\x0clast_seen_ts\x18\x06 \x01(\x03\"(\n\tAttribute\x12\x0c\n\x04name\x18\x01 \x01(\t\x12\r\n\x05value\x18\x02 \x01(\tb\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
@@ -38,27 +38,25 @@ if not _descriptor._USE_C_DESCRIPTORS:
   _globals['_TAG']._serialized_start=241
   _globals['_TAG']._serialized_end=274
   _globals['_METRIC']._serialized_start=277
-  _globals['_METRIC']._serialized_end=652
-  _globals['_METRIC_METRICTYPE']._serialized_start=518
-  _globals['_METRIC_METRICTYPE']._serialized_end=652
-  _globals['_DATAPOINT']._serialized_start=655
-  _globals['_DATAPOINT']._serialized_end=1073
-  _globals['_DATAPOINT_SUMMARY']._serialized_start=907
-  _globals['_DATAPOINT_SUMMARY']._serialized_end=958
-  _globals['_DATAPOINT_HISTOGRAM']._serialized_start=960
-  _globals['_DATAPOINT_HISTOGRAM']._serialized_end=1001
-  _globals['_DATAPOINT_PROFILE']._serialized_start=1003
-  _globals['_DATAPOINT_PROFILE']._serialized_end=1064
-  _globals['_PROFILEFRAME']._serialized_start=1075
-  _globals['_PROFILEFRAME']._serialized_end=1121
-  _globals['_LOGBATCH']._serialized_start=1123
-  _globals['_LOGBATCH']._serialized_end=1225
-  _globals['_LOGENTRY']._serialized_start=1228
-  _globals['_LOGENTRY']._serialized_end=1505
-  _globals['_LOGENTRY_LOGLEVEL']._serialized_start=1366
-  _globals['_LOGENTRY_LOGLEVEL']._serialized_end=1505
-  _globals['_RESOURCE']._serialized_start=1508
-  _globals['_RESOURCE']._serialized_end=1690
-  _globals['_ATTRIBUTE']._serialized_start=1692
-  _globals['_ATTRIBUTE']._serialized_end=1732
+  _globals['_METRIC']._serialized_end=637
+  _globals['_METRIC_METRICTYPE']._serialized_start=517
+  _globals['_METRIC_METRICTYPE']._serialized_end=637
+  _globals['_DATAPOINT']._serialized_start=640
+  _globals['_DATAPOINT']._serialized_end=1061
+  _globals['_DATAPOINT_HISTOGRAM']._serialized_start=834
+  _globals['_DATAPOINT_HISTOGRAM']._serialized_end=983
+  _globals['_DATAPOINT_PROFILE']._serialized_start=985
+  _globals['_DATAPOINT_PROFILE']._serialized_end=1046
+  _globals['_PROFILEFRAME']._serialized_start=1063
+  _globals['_PROFILEFRAME']._serialized_end=1109
+  _globals['_LOGBATCH']._serialized_start=1111
+  _globals['_LOGBATCH']._serialized_end=1213
+  _globals['_LOGENTRY']._serialized_start=1216
+  _globals['_LOGENTRY']._serialized_end=1493
+  _globals['_LOGENTRY_LOGLEVEL']._serialized_start=1354
+  _globals['_LOGENTRY_LOGLEVEL']._serialized_end=1493
+  _globals['_RESOURCE']._serialized_start=1496
+  _globals['_RESOURCE']._serialized_end=1678
+  _globals['_ATTRIBUTE']._serialized_start=1680
+  _globals['_ATTRIBUTE']._serialized_end=1720
 # @@protoc_insertion_point(module_scope)

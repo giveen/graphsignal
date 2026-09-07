@@ -6,7 +6,6 @@ logger = logging.getLogger('graphsignal')
 
 GAUGE = 'gauge'
 COUNTER = 'counter'
-SUMMARY = 'summary'
 HISTOGRAM = 'histogram'
 PROFILE = 'profile'
 
@@ -31,9 +30,10 @@ class Metric:
         # The latest snapshot, overwritten on every set_*:
         # gauge:     {'ts', 'value'}
         # counter:   {'ts', 'total'}                      (cumulative)
-        # summary:   {'ts', 'count', 'sum', 'sum2'}       (cumulative;
-        #            None fields = not measured)
-        # histogram: {'ts', 'bins', 'counts'}             (cumulative)
+        # histogram: {'ts'[, 'bins', 'counts'][, 'count', 'sum', 'min', 'max']}
+        #            (cumulative; bins and the exact aggregates are supplied
+        #            independently, so a distribution with no buckets and a
+        #            bucketed one with no totals are both whole datapoints)
         # profile:   {'ts', 'frames', 'samples'}          (cumulative value and
         #            sample count per frame name, at most MAX_PROFILE_FRAMES)
         self.datapoint = None
@@ -72,43 +72,49 @@ class MetricStore:
             metric.datapoint = {'ts': measurement_ts, 'total': total}
             self._maybe_cleanup(time.time_ns())
 
-    def set_summary(self, name, count, sum_val, sum2_val=None,
-                    measurement_ts=None, tags=None):
+    def set_histogram(self, name, bins=None, counts=None, measurement_ts=None,
+                      tags=None, count=None, sum_val=None, min_val=None,
+                      max_val=None):
+        """The one distribution type: buckets, exact totals, or both.
+
+        Either half alone is a complete histogram. A Prometheus summary has
+        totals and no buckets; an engine that exposes only `le` buckets has
+        buckets and no totals; probes and the native writers have both. What is
+        not a histogram is neither — that call names a metric it cannot
+        describe, and it is rejected rather than stored as an empty series.
+
+        `min`/`max` are the extremes over the instrument's whole life, and only
+        travel when the source keeps them.
+        """
         if name is None:
             raise ValueError('Metric name cannot be None')
-        if count is None:
-            raise ValueError('Summary count cannot be None')
-        if sum_val is None:
-            raise ValueError('Summary sum cannot be None')
+        has_bins = bool(bins) and bool(counts)
+        if has_bins and len(bins) != len(counts):
+            raise ValueError('Histogram bins and counts must be of equal length')
+        has_aggregates = count is not None and sum_val is not None
+        if not has_bins and not has_aggregates:
+            raise ValueError('Histogram requires bins and counts, or count and sum')
 
-        with self._lock:
-            metric = self._get_metric(SUMMARY, name, tags=tags)
-            if metric is None:
-                return
-            metric.datapoint = {
-                'ts': measurement_ts,
-                'count': count,
-                'sum': sum_val,
-                'sum2': sum2_val,
-            }
-            self._maybe_cleanup(time.time_ns())
-
-    def set_histogram(self, name, bins, counts, measurement_ts=None,
-                      tags=None):
-        if name is None:
-            raise ValueError('Metric name cannot be None')
-        if not bins or not counts or len(bins) != len(counts):
-            raise ValueError('Histogram requires bins and counts of equal length')
+        datapoint = {'ts': measurement_ts}
+        if has_bins:
+            datapoint['bins'] = list(bins)
+            datapoint['counts'] = list(counts)
+        # Counts are whole observations; sums and extremes keep the source's
+        # own numeric type — a Prometheus sum is fractional seconds and
+        # truncating it to an integer would report zero.
+        if has_aggregates:
+            datapoint['count'] = int(count)
+            datapoint['sum'] = sum_val
+            if min_val is not None:
+                datapoint['min'] = min_val
+            if max_val is not None:
+                datapoint['max'] = max_val
 
         with self._lock:
             metric = self._get_metric(HISTOGRAM, name, tags=tags)
             if metric is None:
                 return
-            metric.datapoint = {
-                'ts': measurement_ts,
-                'bins': list(bins),
-                'counts': list(counts),
-            }
+            metric.datapoint = datapoint
             self._maybe_cleanup(time.time_ns())
 
     def set_profile(self, name, frames, samples=None, measurement_ts=None,

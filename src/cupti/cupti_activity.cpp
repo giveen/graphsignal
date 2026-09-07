@@ -356,33 +356,61 @@ static void writer_flush_hook(void*) {
   cuptiActivityFlushAll(CUPTI_ACTIVITY_FLAG_FLUSH_FORCED);
 }
 
-// Copies a DEVICE-storage probe's data block to host memory via the driver API
-// so user CUDA probes (probe.h DEVICE storage) can be serialized. Every driver
-// call is checked; any failure (including a not-yet-initialized driver) skips
-// the probe for this write. Never touches CUDA during/after teardown.
-static bool device_probe_reader(const graphsignal_probe_entry* e,
-                                graphsignal_instrument_data* out, void*) {
+// Copies DEVICE-storage probe blocks (probe.h DEVICE storage) to host memory
+// via the driver API so user CUDA probes can be serialized. One call copies a
+// run of `n` contiguous blocks (the writer coalesces adjacent registrations,
+// e.g. a probe_cuda.h pool, into runs — one copy per run instead of one per
+// probe). The copy runs on a private NON-BLOCKING stream of the device's
+// primary context: a synchronous cuMemcpyDtoH on the legacy default stream
+// would wait for, and be waited on by, the workload's own blocking-stream
+// kernels — a device-wide serialization point once per probe per write that
+// the workload would pay for being profiled. Every driver call is checked; any
+// failure (including a not-yet-initialized driver) skips the run for this
+// write. Never touches CUDA during/after teardown (g_running).
+// The primary context is retained ONCE (the retain/release pair per probe was
+// the dominant cost: ~0.25 ms per probe per write) and deliberately never
+// released — it lives until process exit anyway, and teardown makes no CUDA
+// calls. The stream is created once in that context.
+static std::mutex g_probe_stream_mu;
+static CUstream g_probe_stream = nullptr;
+static CUcontext g_probe_ctx = nullptr;
+
+static bool device_probe_batch_reader(const graphsignal_instrument_data* first,
+                                      size_t n, graphsignal_instrument_data* out, void*) {
   if (!g_running.load(std::memory_order_relaxed)) return false;
   try {
-    if (!e || !e->data || !out) return false;
-    CUdevice dev = 0;
-    if (cuDeviceGet(&dev, e->device_id < 0 ? 0 : e->device_id) != CUDA_SUCCESS) {
-      return false;
+    if (!first || !out || n == 0) return false;
+    std::lock_guard<std::mutex> g(g_probe_stream_mu);
+    if (!g_probe_ctx) {
+      CUdevice dev = 0;
+      if (cuDeviceGet(&dev, 0) != CUDA_SUCCESS) return false;
+      CUcontext ctx = nullptr;
+      if (cuDevicePrimaryCtxRetain(&ctx, dev) != CUDA_SUCCESS) return false;
+      g_probe_ctx = ctx;
     }
-    CUcontext ctx = nullptr;
-    if (cuDevicePrimaryCtxRetain(&ctx, dev) != CUDA_SUCCESS) return false;
-    if (cuCtxPushCurrent(ctx) != CUDA_SUCCESS) {
-      cuDevicePrimaryCtxRelease(dev);
-      return false;
+    if (cuCtxPushCurrent(g_probe_ctx) != CUDA_SUCCESS) return false;
+    CUresult rc = CUDA_SUCCESS;
+    if (!g_probe_stream) {
+      rc = cuStreamCreate(&g_probe_stream, CU_STREAM_NON_BLOCKING);
+      if (rc != CUDA_SUCCESS) g_probe_stream = nullptr;
     }
-    const CUresult rc = cuMemcpyDtoH(
-        out, (CUdeviceptr)(uintptr_t)e->data, sizeof(*out));
+    if (rc == CUDA_SUCCESS) {
+      rc = cuMemcpyDtoHAsync(out, (CUdeviceptr)(uintptr_t)first,
+                             n * sizeof(graphsignal_instrument_data), g_probe_stream);
+      if (rc == CUDA_SUCCESS) rc = cuStreamSynchronize(g_probe_stream);
+    }
     cuCtxPopCurrent(nullptr);
-    cuDevicePrimaryCtxRelease(dev);
     return rc == CUDA_SUCCESS;
   } catch (...) {
     return false;
   }
+}
+
+// Single-probe form kept for the per-probe reader hook (tests, fallback).
+static bool device_probe_reader(const graphsignal_probe_entry* e,
+                                graphsignal_instrument_data* out, void*) {
+  if (!e || !e->data) return false;
+  return device_probe_batch_reader(e->data, 1, out, nullptr);
 }
 
 // ---------------------------------------------------------------------------
@@ -606,6 +634,7 @@ int cupti_activity_start(uint64_t write_interval_ns, uint32_t debug_mode) {
 
   g_writer->set_flush_hook(writer_flush_hook, nullptr);
   g_writer->set_device_probe_reader(device_probe_reader, nullptr);
+  g_writer->set_device_probe_batch_reader(device_probe_batch_reader, nullptr);
 
   CUPTI_CALL(cuptiActivityRegisterCallbacks(bufferRequested, bufferCompleted));
 

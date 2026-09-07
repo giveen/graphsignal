@@ -154,19 +154,12 @@ class PrometheusRecorderScrapeTest(unittest.TestCase):
                              'vllm_request_success', {'model_name': 'm'})
         self.assertEqual(metric.datapoint['total'], 150.0)
 
-    def test_histogram_family_emits_summary_and_histogram(self):
+    def test_histogram_family_emits_one_histogram_with_bins_and_totals(self):
         recorder = _recorder(metrics_port=8000)
         self._tick(recorder, _HISTOGRAM_BODY % {
             'b1': '4', 'b2': '7', 'count': '10', 'sum': '25.5'})
 
         exported = self.watcher.metric_store().export()
-        # Both metric types coexist in the store under the same name.
-        summary = find_metric(exported, 'vllm_e2e_latency',
-                              {'model_name': 'm'}, metric_type='summary')
-        self.assertIsNotNone(summary)
-        self.assertEqual(summary.datapoint['count'], 10)
-        self.assertEqual(summary.datapoint['sum'], 25.5)
-
         histogram = find_metric(exported, 'vllm_e2e_latency',
                                 {'model_name': 'm'}, metric_type='histogram')
         self.assertIsNotNone(histogram)
@@ -174,21 +167,28 @@ class PrometheusRecorderScrapeTest(unittest.TestCase):
         # folded into the last finite bound.
         self.assertEqual(histogram.datapoint['bins'], [0.5, 1.0])
         self.assertEqual(histogram.datapoint['counts'], [4, 6])
+        # The exact totals from _count/_sum ride on the same datapoint.
+        self.assertEqual(histogram.datapoint['count'], 10)
+        self.assertEqual(histogram.datapoint['sum'], 25.5)
+        # Prometheus exposes no extremes.
+        self.assertNotIn('min', histogram.datapoint)
+        self.assertNotIn('max', histogram.datapoint)
+        # One metric, not one per half.
+        self.assertEqual(
+            len([m for m in exported if m.name == 'vllm_e2e_latency']), 1)
 
         # Every scrape re-emits raw cumulative values; latest snapshots kept.
         self._tick(recorder, _HISTOGRAM_BODY % {
             'b1': '6', 'b2': '10', 'count': '15', 'sum': '40.0'})
         exported = self.watcher.metric_store().export()
-        summary = find_metric(exported, 'vllm_e2e_latency',
-                              {'model_name': 'm'}, metric_type='summary')
-        self.assertEqual(summary.datapoint['count'], 15)
-        self.assertEqual(summary.datapoint['sum'], 40.0)
         histogram = find_metric(exported, 'vllm_e2e_latency',
                                 {'model_name': 'm'}, metric_type='histogram')
         self.assertEqual(histogram.datapoint['bins'], [0.5, 1.0])
         self.assertEqual(histogram.datapoint['counts'], [6, 9])
+        self.assertEqual(histogram.datapoint['count'], 15)
+        self.assertEqual(histogram.datapoint['sum'], 40.0)
 
-    def test_summary_family_without_buckets_emits_summary_only(self):
+    def test_summary_family_emits_a_histogram_without_bins(self):
         body = """# HELP rpc_duration_seconds RPC duration.
 # TYPE rpc_duration_seconds summary
 rpc_duration_seconds{quantile="0.5"} 0.05
@@ -199,13 +199,13 @@ rpc_duration_seconds_sum 1.5
         self._tick(recorder, body)
 
         exported = self.watcher.metric_store().export()
-        summary = find_metric(exported, 'rpc_duration_seconds',
-                              metric_type='summary')
-        self.assertIsNotNone(summary)
-        self.assertEqual(summary.datapoint['count'], 12)
-        self.assertEqual(summary.datapoint['sum'], 1.5)
-        self.assertIsNone(find_metric(exported, 'rpc_duration_seconds',
-                                      metric_type='histogram'))
+        histogram = find_metric(exported, 'rpc_duration_seconds',
+                                metric_type='histogram')
+        self.assertIsNotNone(histogram)
+        self.assertEqual(histogram.datapoint['count'], 12)
+        # Fractional seconds survive: a truncated sum would read 1.
+        self.assertEqual(histogram.datapoint['sum'], 1.5)
+        self.assertNotIn('bins', histogram.datapoint)
 
     def test_skips_gauge_histogram_bucket_labels(self):
         body = """# HELP sglang:routing_key_running_req_count Distribution of routing keys.

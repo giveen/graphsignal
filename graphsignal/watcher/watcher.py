@@ -432,17 +432,13 @@ class Watcher:
         self._metric_store.set_counter(
             name=name, total=total, measurement_ts=measurement_ts, tags=tags)
 
-    def set_summary(self, name, count, sum_val, sum2_val=None,
-                    measurement_ts=None, tags=None):
-        self._metric_store.set_summary(
-            name=name, count=count, sum_val=sum_val, sum2_val=sum2_val,
-            measurement_ts=measurement_ts, tags=tags)
-
-    def set_histogram(self, name, bins, counts, measurement_ts=None,
-                      tags=None):
+    def set_histogram(self, name, bins=None, counts=None, measurement_ts=None,
+                      tags=None, count=None, sum_val=None, min_val=None,
+                      max_val=None):
         self._metric_store.set_histogram(
             name=name, bins=bins, counts=counts,
-            measurement_ts=measurement_ts, tags=tags)
+            measurement_ts=measurement_ts, tags=tags, count=count,
+            sum_val=sum_val, min_val=min_val, max_val=max_val)
 
     def set_profile(self, name, frames, samples=None, measurement_ts=None,
                     tags=None):

@@ -26,6 +26,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <algorithm>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -60,6 +61,13 @@ struct Instrument {
   double gauge_value = 0.0;
   uint64_t counter_total = 0;
   uint64_t bins[GRAPHSIGNAL_PROBE_HIST_BINS] = {0};
+  // Exact histogram aggregates next to the 25 %-wide bins: a reader that
+  // needs totals (time per iteration = sum / iterations) or the true mean
+  // cannot get them from bins; the probe.h device block already keeps them.
+  uint64_t hist_count = 0;
+  uint64_t hist_sum = 0;
+  uint64_t hist_min = UINT64_MAX;
+  uint64_t hist_max = 0;
   // Profile instruments: frame name -> cumulative value and how many
   // recordings contributed to it, capped at kMaxProfileFrames (new frames
   // past the cap are dropped).
@@ -124,6 +132,16 @@ class MetricsWriter {
   // to skip the probe (e.g. device not initialized yet, or during teardown).
   using DeviceProbeReader = bool (*)(const graphsignal_probe_entry*,
                                      graphsignal_instrument_data*, void*);
+  // Copies `n` consecutive device blocks starting at `first` (the data pointer
+  // of one entry; the blocks of the run are contiguous in device memory) into
+  // out[0..n). Returns false to skip the whole run. When set, the serializer
+  // groups the registry's device probes into contiguous runs and issues one
+  // copy per run instead of one per probe — a process with a thousand device
+  // probes (one per SM per phase) then costs a few copies per write, not a
+  // thousand driver round trips.
+  using DeviceProbeBatchReader = bool (*)(const graphsignal_instrument_data* first,
+                                          size_t n, graphsignal_instrument_data* out,
+                                          void*);
 
   // Never throws; returns nullptr on failure (callers degrade to no-op).
   static MetricsWriter* init(const char* libname, const char* base_dir,
@@ -151,6 +169,18 @@ class MetricsWriter {
     device_reader_ = fn;
     device_reader_arg_ = arg;
   }
+
+  void set_device_probe_batch_reader(DeviceProbeBatchReader fn, void* arg) {
+    std::lock_guard<std::mutex> g(hook_mu_);
+    device_batch_reader_ = fn;
+    device_batch_reader_arg_ = arg;
+  }
+
+  // Statistics of the last serialize (debug log + tests): device probes seen,
+  // contiguous runs copied, time spent reading device probes.
+  uint64_t last_device_probes() const { return last_device_probes_.load(std::memory_order_relaxed); }
+  uint64_t last_device_runs() const { return last_device_runs_.load(std::memory_order_relaxed); }
+  uint64_t last_device_read_ns() const { return last_device_read_ns_.load(std::memory_order_relaxed); }
 
   // --- instruments (registration is idempotent per name+tags) ---
 
@@ -191,6 +221,10 @@ class MetricsWriter {
     if (!inst) return;
     std::lock_guard<std::mutex> g(inst->mu);
     inst->bins[graphsignal_probe_bin_index(value)]++;
+    inst->hist_count++;
+    inst->hist_sum += value;
+    if (value < inst->hist_min) inst->hist_min = value;
+    if (value > inst->hist_max) inst->hist_max = value;
   }
 
   // Counter: add to the cumulative total.
@@ -463,6 +497,7 @@ class MetricsWriter {
           break;
         case InstrumentType::Histogram:
           serialize_bins(j, inst->bins);
+          serialize_hist_aggregates(j, inst->hist_count, inst->hist_sum, inst->hist_min, inst->hist_max);
           break;
         case InstrumentType::Profile:
           serialize_frames(j, inst->frames);
@@ -482,19 +517,90 @@ class MetricsWriter {
     }
   }
 
-  void serialize_probes(std::string& j, bool& first_metric) {
-    graphsignal_probe_registry* reg = graphsignal_probe_reader_attach();
-    if (!reg) return;
+  // Device probes are read before serialization: sorted by device address,
+  // grouped into runs of adjacent blocks, one batch copy per run (or one
+  // single-probe copy each when only the per-probe reader is set). A probe
+  // whose run failed to copy is skipped for this write, as before.
+  struct DeviceRead {
+    uint64_t index;    // registry index
+    const graphsignal_instrument_data* dev;
+    size_t slot;       // position in `host` after the copy
+    bool ok;
+  };
 
+  void read_device_probes(const graphsignal_probe_registry* reg, uint64_t count,
+                          std::vector<DeviceRead>& reads,
+                          std::vector<graphsignal_instrument_data>& host) {
     DeviceProbeReader device_reader = nullptr;
     void* device_reader_arg = nullptr;
+    DeviceProbeBatchReader batch_reader = nullptr;
+    void* batch_reader_arg = nullptr;
     {
       std::lock_guard<std::mutex> g(hook_mu_);
       device_reader = device_reader_;
       device_reader_arg = device_reader_arg_;
+      batch_reader = device_batch_reader_;
+      batch_reader_arg = device_batch_reader_arg_;
     }
+    reads.clear();
+    for (uint64_t i = 0; i < count; i++) {
+      const graphsignal_probe_entry* e = &reg->entries[i];
+      if (e->type == GRAPHSIGNAL_PROFILE || e->storage != GRAPHSIGNAL_STORAGE_DEVICE || !e->data) continue;
+      reads.push_back(DeviceRead{i, e->data, 0, false});
+    }
+    last_device_probes_.store(reads.size(), std::memory_order_relaxed);
+    if (reads.empty() || (!device_reader && !batch_reader)) {
+      last_device_runs_.store(0, std::memory_order_relaxed);
+      last_device_read_ns_.store(0, std::memory_order_relaxed);
+      return;
+    }
+    const uint64_t t0 = now_ns();
+    host.resize(reads.size());
+    uint64_t runs = 0;
+    if (batch_reader) {
+      std::vector<size_t> order(reads.size());
+      for (size_t k = 0; k < order.size(); k++) order[k] = k;
+      std::sort(order.begin(), order.end(), [&](size_t a, size_t b) { return reads[a].dev < reads[b].dev; });
+      size_t slot = 0;
+      for (size_t k = 0; k < order.size();) {
+        size_t m = k + 1;
+        while (m < order.size() && reads[order[m]].dev == reads[order[m - 1]].dev + 1) m++;
+        const size_t n = m - k;
+        const bool ok = batch_reader(reads[order[k]].dev, n, host.data() + slot, batch_reader_arg);
+        for (size_t q = k; q < m; q++) {
+          reads[order[q]].slot = slot + (q - k);
+          reads[order[q]].ok = ok;
+        }
+        slot += n;
+        runs++;
+        k = m;
+      }
+    } else {
+      for (size_t k = 0; k < reads.size(); k++) {
+        reads[k].slot = k;
+        reads[k].ok = device_reader(&reg->entries[reads[k].index], &host[k], device_reader_arg);
+        runs++;
+      }
+    }
+    last_device_runs_.store(runs, std::memory_order_relaxed);
+    last_device_read_ns_.store(now_ns() - t0, std::memory_order_relaxed);
+    if (debug_enabled()) {
+      debug("device probes: %llu read in %llu contiguous run(s), %llu us",
+            static_cast<unsigned long long>(reads.size()), static_cast<unsigned long long>(runs),
+            static_cast<unsigned long long>(last_device_read_ns_.load(std::memory_order_relaxed) / 1000ull));
+    }
+  }
+
+  void serialize_probes(std::string& j, bool& first_metric) {
+    graphsignal_probe_registry* reg = graphsignal_probe_reader_attach();
+    if (!reg) return;
 
     uint64_t count = graphsignal_probe_reader_count(reg);
+    std::vector<DeviceRead> reads;
+    std::vector<graphsignal_instrument_data> host;
+    read_device_probes(reg, count, reads, host);
+    size_t next_read = 0;
+
     graphsignal_instrument_data snap;
     for (uint64_t i = 0; i < count; i++) {
       const graphsignal_probe_entry* e = &reg->entries[i];
@@ -505,7 +611,9 @@ class MetricsWriter {
       if (e->storage == GRAPHSIGNAL_STORAGE_HOST) {
         if (!graphsignal_probe_snapshot(e, &snap)) continue;
       } else {
-        if (!device_reader || !device_reader(e, &snap, device_reader_arg)) continue;
+        while (next_read < reads.size() && reads[next_read].index < i) next_read++;
+        if (next_read >= reads.size() || reads[next_read].index != i || !reads[next_read].ok) continue;
+        snap = host[reads[next_read].slot];
       }
 
       if (!first_metric) j += ',';
@@ -527,6 +635,7 @@ class MetricsWriter {
           break;
         default:
           serialize_bins(j, snap.bins);
+          serialize_hist_aggregates(j, snap.count, snap.sum, snap.min, snap.max);
       }
       j += '}';
     }
@@ -626,6 +735,25 @@ class MetricsWriter {
     j += "}}";
   }
 
+  // Exact aggregates of a histogram ("count","sum","min","max"). Bins and
+  // aggregates are independent halves of the same metric: either alone is a
+  // whole histogram to the importer, and an instrument that has recorded
+  // nothing emits neither, so it is skipped rather than stored as an empty
+  // series.
+  static void serialize_hist_aggregates(std::string& j, uint64_t count, uint64_t sum,
+                                        uint64_t min, uint64_t max) {
+    if (count == 0) return;
+    j += ",\"count\":";
+    append_u64(j, count);
+    j += ",\"sum\":";
+    append_u64(j, sum);
+    j += ",\"min\":";
+    append_u64(j, min);
+    j += ",\"max\":";
+    append_u64(j, max);
+  }
+
+  // Omitted entirely when every bin is empty — see serialize_hist_aggregates.
   static void serialize_bins(std::string& j, const uint64_t* bins) {
     std::string bins_json;
     std::string counts_json;
@@ -638,6 +766,7 @@ class MetricsWriter {
       append_u64(bins_json, graphsignal_probe_bin_lower(b));
       append_u64(counts_json, bins[b]);
     }
+    if (bins_json.empty()) return;
     j += ",\"bins\":[";
     j += bins_json;
     j += "],\"counts\":[";
@@ -716,6 +845,11 @@ class MetricsWriter {
   void* flush_arg_ = nullptr;
   DeviceProbeReader device_reader_ = nullptr;
   void* device_reader_arg_ = nullptr;
+  DeviceProbeBatchReader device_batch_reader_ = nullptr;
+  void* device_batch_reader_arg_ = nullptr;
+  std::atomic<uint64_t> last_device_probes_{0};
+  std::atomic<uint64_t> last_device_runs_{0};
+  std::atomic<uint64_t> last_device_read_ns_{0};
 
   std::mutex log_mu_;
   std::vector<LogEntry> log_ring_;

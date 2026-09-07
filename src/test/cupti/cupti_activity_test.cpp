@@ -209,8 +209,8 @@ static uint64_t counts_total(const std::string& block) {
   return total;
 }
 
-// Histogram sanity: histograms serialize ONLY sparse bins/counts arrays (no
-// aggregate fields); the observation total is the sum of the counts.
+// Histogram sanity: sparse bins/counts arrays plus the exact aggregates
+// (count = the sum of the counts, sum, min, max) whenever a value was observed.
 static void assert_histogram_sane(const std::string& block, uint64_t min_count,
                                   const char* what) {
   ASSERT(!block.empty(), what);
@@ -220,14 +220,15 @@ static void assert_histogram_sane(const std::string& block, uint64_t min_count,
   std::printf("%s: counts_total=%llu\n", what,
               static_cast<unsigned long long>(total));
   ASSERT(total >= min_count, what);
-  ASSERT(block.find("\"count\":") == std::string::npos,
-         "histogram must not serialize count");
-  ASSERT(block.find("\"sum\":") == std::string::npos,
-         "histogram must not serialize sum");
-  ASSERT(block.find("\"min\":") == std::string::npos,
-         "histogram must not serialize min");
-  ASSERT(block.find("\"max\":") == std::string::npos,
-         "histogram must not serialize max");
+  if (total > 0) {
+    char expect[64];
+    std::snprintf(expect, sizeof(expect), "\"count\":%llu,", static_cast<unsigned long long>(total));
+    ASSERT(block.find(expect) != std::string::npos,
+           "histogram count must equal the sum of the bin counts");
+    ASSERT(block.find("\"sum\":") != std::string::npos, "histogram must serialize sum");
+    ASSERT(block.find("\"min\":") != std::string::npos, "histogram must serialize min");
+    ASSERT(block.find("\"max\":") != std::string::npos, "histogram must serialize max");
+  }
 }
 
 // ---------------------------------------------------------------------------

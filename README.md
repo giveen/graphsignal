@@ -83,7 +83,7 @@ curl -s http://127.0.0.1:18259/signals
 The response contains:
 
 * `context` — run and host identity tags.
-* `metrics` — every metric as its latest snapshot: gauges report the current value; counters report cumulative totals; summaries report `count/sum/avg`; histograms report `mean/p50/p95` computed from their bins; profiles report per-frame cumulative values (e.g. time per kernel), sorted descending.
+* `metrics` — every metric as its latest snapshot: gauges report the current value; counters report cumulative totals; histograms report exact `count/sum/min/max` plus `mean` and `p50/p95` estimated from their bins; profiles report per-frame cumulative values (e.g. time per kernel), sorted descending.
 * `errors` — the most recent warnings and errors, including exceptions extracted from engine console output.
 * `resources` — hosts, processes (with command lines), and GPU devices.
 

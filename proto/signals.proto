@@ -22,7 +22,10 @@ message Metric {
     UNDEFINED_METRIC = 0;
     GAUGE_METRIC = 1;
     COUNTER_METRIC = 2;
-    SUMMARY_METRIC = 3;
+    // 3 was SUMMARY_METRIC. Histograms carry count/sum/min/max, so a summary
+    // is a histogram with no bins; the number stays burned so a stored enum
+    // value never changes meaning.
+    reserved 3;
     HISTOGRAM_METRIC = 4;
     PROFILE_METRIC = 5;
   }
@@ -35,24 +38,31 @@ message Metric {
 }
 
 message DataPoint {
-  message Summary {
-    int64 count = 1;
-    double sum = 2;
-    double sum2 = 3;
-  }
+  // Bins and the exact aggregates are independent: a producer with only
+  // buckets (Prometheus histogram) sends both, one with only totals
+  // (Prometheus summary) sends the aggregates alone, and quantiles are then
+  // unavailable rather than estimated. `optional` so an absent aggregate is
+  // distinguishable from a measured zero.
   message Histogram {
     repeated double bins = 1;
     repeated int64 counts = 2;
+    optional int64 count = 3;
+    optional double sum = 4;
+    // Extremes over the instrument's whole life, NOT over this datapoint's
+    // interval: they are read from cumulative instruments that never reset,
+    // and no delta of two cumulative extremes is the interval's extreme.
+    optional double min = 5;
+    optional double max = 6;
   }
   message Profile {
     repeated uint64 frame_ids = 1;
     repeated uint64 values = 2;
     repeated uint64 samples = 3;
   }
+  reserved 3;  // was Summary summary
   oneof value {
     double gauge = 1;
     double total = 2;
-    Summary summary = 3;
     Histogram histogram = 4;
     Profile profile = 5;
   }

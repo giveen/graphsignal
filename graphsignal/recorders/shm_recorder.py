@@ -146,12 +146,20 @@ class ShmRecorder(BaseRecorder):
                 elif metric_type == 'counter':
                     watcher.set_counter(name, entry['value'], write_ts, tags=tags)
                 elif metric_type == 'histogram':
+                    # Bins and exact aggregates arrive independently; the
+                    # writer omits the aggregates for an instrument that has
+                    # never been recorded, which set_histogram then rejects —
+                    # the same way an all-empty histogram was always dropped.
                     watcher.set_histogram(
                         name,
-                        bins=entry['bins'],
-                        counts=entry['counts'],
+                        bins=entry.get('bins'),
+                        counts=entry.get('counts'),
                         measurement_ts=write_ts,
-                        tags=tags)
+                        tags=tags,
+                        count=entry.get('count'),
+                        sum_val=entry.get('sum'),
+                        min_val=entry.get('min'),
+                        max_val=entry.get('max'))
                 elif metric_type == 'profile':
                     # A frame arrives as [cumulative value, sample count].
                     frame_entries = entry['frames'].items()

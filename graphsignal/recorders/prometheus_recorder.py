@@ -127,8 +127,9 @@ class PrometheusRecorder(BaseRecorder):
 
     def _parse_and_emit(self, body: str) -> None:
         # Scraped values pass through as-is: gauges and counters as the raw
-        # cumulative values, histograms with their buckets converted to
-        # non-cumulative bins.
+        # cumulative values, histogram and summary families as one histogram
+        # each — exact `_count`/`_sum`, plus `le` buckets converted to
+        # non-cumulative bins where the family has them.
         watcher = graphsignal.watcher.watcher()
         now_ns = time.time_ns()
 
@@ -165,17 +166,19 @@ class PrometheusRecorder(BaseRecorder):
                         watcher.set_counter(name=name, tags=tags, total=s.value, measurement_ts=now_ns)
 
                 elif mtype in ('histogram', 'summary'):
+                    # Both families land as ONE histogram. A Prometheus summary
+                    # has _count/_sum and quantiles we do not keep, so it
+                    # arrives with no bins; a histogram adds its `le` buckets on
+                    # top of the same totals. One name, one type, whichever the
+                    # engine happens to expose.
                     c = sample_map.get(f'{name}_count')
                     su = sample_map.get(f'{name}_sum')
                     if c is not None and su is not None and _is_finite_number(c.value) and _is_finite_number(su.value):
-                        watcher.set_summary(name=name, tags=tags,
-                                            count=int(c.value), sum_val=su.value,
-                                            measurement_ts=now_ns)
                         bins, counts = _buckets_to_bins(bucket_groups.get(group_key))
-                        if bins:
-                            watcher.set_histogram(name=name, tags=tags,
-                                                  bins=bins, counts=counts,
-                                                  measurement_ts=now_ns)
+                        watcher.set_histogram(name=name, tags=tags,
+                                              bins=bins, counts=counts,
+                                              count=int(c.value), sum_val=su.value,
+                                              measurement_ts=now_ns)
 
 
 def _buckets_to_bins(buckets):

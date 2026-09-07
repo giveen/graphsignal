@@ -57,6 +57,10 @@ class ShmRecorderImportTest(unittest.TestCase):
                 {'name': 'user_hist', 'type': 'histogram',
                  'tags': {'op': 'o1'},
                  'bins': [0, 10, 20, 30], 'counts': [1, 4, 3, 2]},
+                {'name': 'exact_hist', 'type': 'histogram',
+                 'tags': {'op': 'o2'},
+                 'bins': [8], 'counts': [2],
+                 'count': 2, 'sum': 19, 'min': 9, 'max': 10},
                 {'name': 'cuda_kernels_nanoseconds', 'type': 'profile',
                  'tags': {}, 'frames': {'kern_a': [123, 4], 'kern_b': [7, 1]}},
             ]))
@@ -84,6 +88,13 @@ class ShmRecorderImportTest(unittest.TestCase):
         self.assertEqual(histogram.datapoint, {
             'ts': 200, 'bins': [0, 10, 20, 30], 'counts': [1, 4, 3, 2]})
 
+        exact = find_metric(exported, 'exact_hist', {**base_tags, 'op': 'o2'})
+        self.assertIsNotNone(exact)
+        # A writer that carries the exact aggregates gets them stored as is.
+        self.assertEqual(exact.datapoint, {
+            'ts': 200, 'bins': [8], 'counts': [2],
+            'count': 2, 'sum': 19, 'min': 9, 'max': 10})
+
         profile = find_metric(exported, 'cuda_kernels_nanoseconds', base_tags)
         self.assertIsNotNone(profile)
         self.assertEqual(profile.type, 'profile')
@@ -93,25 +104,33 @@ class ShmRecorderImportTest(unittest.TestCase):
             'ts': 200, 'frames': {'kern_a': 123, 'kern_b': 7},
             'samples': {'kern_a': 4, 'kern_b': 1}})
 
-    def test_histogram_entry_without_bins_skipped_as_malformed(self):
+    def test_histogram_entry_with_neither_half_skipped_as_malformed(self):
         self._write_file(self._payload(metrics=[
-            {'name': 'no_bins', 'type': 'histogram'},
+            {'name': 'nothing', 'type': 'histogram'},
             {'name': 'counts_only', 'type': 'histogram', 'counts': [1, 2]},
             {'name': 'mismatched', 'type': 'histogram',
              'bins': [0, 10], 'counts': [1]},
             {'name': 'ok_hist', 'type': 'histogram',
              'bins': [0, 10], 'counts': [1, 2]},
+            # The writer omits bins entirely for an unrecorded instrument, and
+            # the exact totals alone are a whole histogram.
+            {'name': 'totals_only', 'type': 'histogram',
+             'count': 3, 'sum': 24, 'min': 4, 'max': 12},
         ]))
 
         self.recorder.on_tick()  # must not raise
         exported = self.watcher.metric_store().export()
-        self.assertIsNone(find_metric(exported, 'no_bins'))
+        self.assertIsNone(find_metric(exported, 'nothing'))
         self.assertIsNone(find_metric(exported, 'counts_only'))
         self.assertIsNone(find_metric(exported, 'mismatched'))
         ok = find_metric(exported, 'ok_hist')
         self.assertIsNotNone(ok)
         self.assertEqual(ok.datapoint['bins'], [0, 10])
         self.assertEqual(ok.datapoint['counts'], [1, 2])
+        totals = find_metric(exported, 'totals_only')
+        self.assertIsNotNone(totals)
+        self.assertEqual(totals.datapoint, {
+            'ts': 200, 'count': 3, 'sum': 24, 'min': 4, 'max': 12})
 
     def test_profile_entry_without_frames_skipped_as_malformed(self):
         self._write_file(self._payload(metrics=[

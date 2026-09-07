@@ -5,7 +5,7 @@ from unittest.mock import patch
 
 from graphsignal.signals import metrics as metrics_module
 from graphsignal.signals.metrics import (
-    MetricStore, GAUGE, COUNTER, SUMMARY, HISTOGRAM, PROFILE,
+    MetricStore, GAUGE, COUNTER, HISTOGRAM, PROFILE,
     METRIC_EXPIRY_NS)
 
 
@@ -68,47 +68,6 @@ class MetricStoreCounterTest(unittest.TestCase):
             self.store.set_counter('c1', None, measurement_ts=10)
 
 
-class MetricStoreSummaryTest(unittest.TestCase):
-    def setUp(self):
-        self.store = MetricStore()
-        # Suppress the timestamp-based cleanup so small synthetic
-        # measurement_ts values are kept; cleanup has its own test class.
-        self.store._last_cleanup_ts = time.time_ns()
-
-    def test_set_summary_overwrites_datapoint(self):
-        self.store.set_summary('s1', count=10, sum_val=100.0, sum2_val=1500.0,
-                               measurement_ts=10, tags={'t1': '1'})
-        self.store.set_summary('s1', count=15, sum_val=200.0, sum2_val=3100.0,
-                               measurement_ts=20, tags={'t1': '1'})
-
-        exported = self.store.export()
-        self.assertEqual(len(exported), 1)
-        metric = exported[0]
-        self.assertEqual(metric.type, SUMMARY)
-        self.assertEqual(metric.datapoint, {
-            'ts': 20, 'count': 15, 'sum': 200.0, 'sum2': 3100.0})
-
-    def test_sum2_defaults_to_none(self):
-        self.store.set_summary('s1', count=4, sum_val=8.0, measurement_ts=10)
-        dp = self.store.export()[0].datapoint
-        self.assertEqual(dp, {'ts': 10, 'count': 4, 'sum': 8.0, 'sum2': None})
-
-    def test_none_name_raises(self):
-        with self.assertRaises(ValueError):
-            self.store.set_summary(None, count=1, sum_val=1.0,
-                                   measurement_ts=10)
-
-    def test_none_count_raises(self):
-        with self.assertRaises(ValueError):
-            self.store.set_summary('s1', count=None, sum_val=1.0,
-                                   measurement_ts=10)
-
-    def test_none_sum_raises(self):
-        with self.assertRaises(ValueError):
-            self.store.set_summary('s1', count=1, sum_val=None,
-                                   measurement_ts=10)
-
-
 class MetricStoreHistogramTest(unittest.TestCase):
     def setUp(self):
         self.store = MetricStore()
@@ -129,6 +88,22 @@ class MetricStoreHistogramTest(unittest.TestCase):
         self.assertEqual(metric.datapoint, {
             'ts': 20, 'bins': [0, 10, 20], 'counts': [4, 6, 5]})
 
+    def test_aggregates_kept_only_as_a_complete_count_and_sum_pair(self):
+        self.store.set_histogram('h1', bins=[8], counts=[2],
+                                 measurement_ts=100, count=2, sum_val=19,
+                                 min_val=9, max_val=10)
+        dp = self.store.export()[0].datapoint
+        self.assertEqual(dp['count'], 2)
+        self.assertEqual(dp['sum'], 19)
+        self.assertEqual(dp['min'], 9)
+        self.assertEqual(dp['max'], 10)
+        # sum without count (or vice versa) is not an aggregate: dropped.
+        self.store.set_histogram('h1', bins=[8], counts=[2],
+                                 measurement_ts=101, sum_val=19)
+        dp = self.store.export()[0].datapoint
+        self.assertNotIn('count', dp)
+        self.assertNotIn('sum', dp)
+
     def test_bins_and_counts_copied_from_caller(self):
         bins = [0, 10]
         counts = [1, 2]
@@ -146,18 +121,30 @@ class MetricStoreHistogramTest(unittest.TestCase):
             self.store.set_histogram(None, bins=[1], counts=[1],
                                      measurement_ts=10)
 
-    def test_missing_bins_raises(self):
+    def test_aggregates_without_bins_are_a_whole_histogram(self):
+        self.store.set_histogram('h1', measurement_ts=10, count=4,
+                                 sum_val=1.25, min_val=0.1, max_val=0.9)
+        dp = self.store.export()[0].datapoint
+        self.assertEqual(dp, {'ts': 10, 'count': 4, 'sum': 1.25,
+                              'min': 0.1, 'max': 0.9})
+
+    def test_fractional_sum_is_not_truncated(self):
+        self.store.set_histogram('h1', measurement_ts=10, count=2,
+                                 sum_val=0.25)
+        self.assertEqual(self.store.export()[0].datapoint['sum'], 0.25)
+
+    def test_neither_bins_nor_aggregates_raises(self):
         with self.assertRaises(ValueError):
-            self.store.set_histogram('h1', bins=None, counts=[1],
-                                     measurement_ts=10)
+            self.store.set_histogram('h1', measurement_ts=10)
         with self.assertRaises(ValueError):
             self.store.set_histogram('h1', bins=[], counts=[],
                                      measurement_ts=10)
-
-    def test_missing_counts_raises(self):
+        # Half a bin pair is no distribution, and half an aggregate is none.
         with self.assertRaises(ValueError):
             self.store.set_histogram('h1', bins=[1], counts=None,
                                      measurement_ts=10)
+        with self.assertRaises(ValueError):
+            self.store.set_histogram('h1', measurement_ts=10, count=4)
 
     def test_mismatched_bins_and_counts_raise(self):
         with self.assertRaises(ValueError):
@@ -213,19 +200,18 @@ class MetricStoreProfileTest(unittest.TestCase):
 
 
 class MetricStoreTypeKeyTest(unittest.TestCase):
-    def test_same_name_and_tags_coexist_as_summary_and_histogram(self):
+    def test_same_name_and_tags_coexist_as_counter_and_histogram(self):
         store = MetricStore()
         store._last_cleanup_ts = time.time_ns()
-        store.set_summary('m1', count=10, sum_val=25.5, measurement_ts=10,
-                          tags={'t1': '1'})
+        store.set_counter('m1', 10, measurement_ts=10, tags={'t1': '1'})
         store.set_histogram('m1', bins=[0.5, 1.0], counts=[4, 6],
                             measurement_ts=10, tags={'t1': '1'})
 
         exported = {m.type: m for m in store.export()}
-        self.assertEqual(set(exported.keys()), {SUMMARY, HISTOGRAM})
-        self.assertEqual(exported[SUMMARY].name, 'm1')
+        self.assertEqual(set(exported.keys()), {COUNTER, HISTOGRAM})
+        self.assertEqual(exported[COUNTER].name, 'm1')
         self.assertEqual(exported[HISTOGRAM].name, 'm1')
-        self.assertEqual(exported[SUMMARY].datapoint['count'], 10)
+        self.assertEqual(exported[COUNTER].datapoint['total'], 10)
         self.assertEqual(exported[HISTOGRAM].datapoint['bins'], [0.5, 1.0])
 
 
@@ -314,7 +300,6 @@ class MetricStoreExportTest(unittest.TestCase):
         store._last_cleanup_ts = time.time_ns()
         store.set_gauge('g1', 1.0, measurement_ts=10, tags={'t': '1'})
         store.set_counter('c1', 5, measurement_ts=10)
-        store.set_summary('s1', count=1, sum_val=2.0, measurement_ts=10)
         store.set_histogram('h1', bins=[1], counts=[1], measurement_ts=10)
         store.set_profile('p1', frames={'a': 1}, measurement_ts=10)
 
@@ -326,7 +311,7 @@ class MetricStoreExportTest(unittest.TestCase):
         store = MetricStore()
         store._last_cleanup_ts = time.time_ns()
         store.set_gauge('g1', 1.0, measurement_ts=10, tags={'t': '1'})
-        store.set_summary('s1', count=1, sum_val=2.0, measurement_ts=10)
+        store.set_histogram('h1', count=1, sum_val=2.0, measurement_ts=10)
         store.set_profile('p1', frames={'a': 1}, measurement_ts=10)
 
         exported = store.export()
@@ -341,8 +326,8 @@ class MetricStoreExportTest(unittest.TestCase):
         fresh = {m.name: m for m in store.export()}
         self.assertEqual(fresh['g1'].tags, {'t': '1'})
         self.assertEqual(fresh['g1'].datapoint, {'ts': 10, 'value': 1.0})
-        self.assertEqual(fresh['s1'].datapoint['ts'], 10)
-        self.assertEqual(fresh['s1'].datapoint['count'], 1)
+        self.assertEqual(fresh['h1'].datapoint['ts'], 10)
+        self.assertEqual(fresh['h1'].datapoint['count'], 1)
         self.assertEqual(fresh['p1'].datapoint['frames'], {'a': 1})
 
 

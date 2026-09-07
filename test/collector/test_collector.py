@@ -98,55 +98,86 @@ class CollectorTest(unittest.TestCase):
         self.assertEqual(len(protos), 1)
         self.assertEqual(protos[0].datapoints[0].total, 30)
 
-    def test_summary_delta_uploaded(self):
-        self.metric_store.set_summary(
-            's1', count=10, sum_val=100.0, sum2_val=1200.0, measurement_ts=10)
+    def test_histogram_aggregate_deltas_uploaded(self):
+        # No bins: a Prometheus summary. count/sum go out as deltas, and the
+        # datapoint carries no histogram bins at all.
+        self.metric_store.set_histogram(
+            's1', count=10, sum_val=100.0, min_val=0.5, max_val=40.0,
+            measurement_ts=10)
         self.collector.on_tick(self.watcher)
         protos = self._uploaded_metrics()
         self.assertEqual(len(protos), 1)
         self.assertEqual(protos[0].type,
-                         signals_pb2.Metric.MetricType.SUMMARY_METRIC)
+                         signals_pb2.Metric.MetricType.HISTOGRAM_METRIC)
         dp = protos[0].datapoints[0]
-        self.assertEqual(dp.summary.count, 10)
-        self.assertEqual(dp.summary.sum, 100.0)
-        self.assertEqual(dp.summary.sum2, 1200.0)
+        self.assertEqual(list(dp.histogram.bins), [])
+        self.assertEqual(dp.histogram.count, 10)
+        self.assertEqual(dp.histogram.sum, 100.0)
         self.assertEqual(dp.measurement_ts, 10)
 
         # Count unchanged: nothing uploaded.
         self.uploader.upload_metric.reset_mock()
-        self.metric_store.set_summary(
-            's1', count=10, sum_val=100.0, sum2_val=1200.0, measurement_ts=20)
+        self.metric_store.set_histogram(
+            's1', count=10, sum_val=100.0, measurement_ts=20)
         self.collector.on_tick(self.watcher)
         self.uploader.upload_metric.assert_not_called()
 
-        # Count grew: only the count/sum/sum2 deltas go out.
-        self.metric_store.set_summary(
-            's1', count=15, sum_val=160.0, sum2_val=2000.0, measurement_ts=30)
+        # Count grew: only the count/sum deltas go out.
+        self.metric_store.set_histogram(
+            's1', count=15, sum_val=160.0, measurement_ts=30)
         self.collector.on_tick(self.watcher)
         protos = self._uploaded_metrics()
         self.assertEqual(len(protos), 1)
         dp = protos[0].datapoints[0]
-        self.assertEqual(dp.summary.count, 5)
-        self.assertEqual(dp.summary.sum, 60.0)
-        self.assertEqual(dp.summary.sum2, 800.0)
+        self.assertEqual(dp.histogram.count, 5)
+        self.assertEqual(dp.histogram.sum, 60.0)
         self.assertEqual(dp.measurement_ts, 30)
 
-    def test_summary_count_reset_uploads_full_current_values(self):
-        self.metric_store.set_summary(
-            's1', count=15, sum_val=160.0, sum2_val=2000.0, measurement_ts=10)
+    def test_histogram_min_and_max_uploaded_undeltaed(self):
+        # Lifetime extremes: the delta of two of them is not the interval's
+        # extreme, so each upload carries the current pair as it stands.
+        self.metric_store.set_histogram(
+            'h1', bins=[5], counts=[1], measurement_ts=10,
+            count=1, sum_val=7.0, min_val=7.0, max_val=7.0)
+        self.collector.on_tick(self.watcher)
+        dp = self._uploaded_metrics()[0].datapoints[0]
+        self.assertEqual(dp.histogram.min, 7.0)
+        self.assertEqual(dp.histogram.max, 7.0)
+
+        self.uploader.upload_metric.reset_mock()
+        self.metric_store.set_histogram(
+            'h1', bins=[5, 20], counts=[1, 1], measurement_ts=20,
+            count=2, sum_val=30.0, min_val=7.0, max_val=23.0)
+        self.collector.on_tick(self.watcher)
+        dp = self._uploaded_metrics()[0].datapoints[0]
+        self.assertEqual(dp.histogram.min, 7.0)
+        self.assertEqual(dp.histogram.max, 23.0)
+
+    def test_histogram_absent_aggregates_stay_absent(self):
+        self.metric_store.set_histogram(
+            'h1', bins=[5], counts=[1], measurement_ts=10)
+        self.collector.on_tick(self.watcher)
+        dp = self._uploaded_metrics()[0].datapoints[0]
+        self.assertFalse(dp.histogram.HasField('count'))
+        self.assertFalse(dp.histogram.HasField('sum'))
+        self.assertFalse(dp.histogram.HasField('min'))
+        self.assertFalse(dp.histogram.HasField('max'))
+
+    def test_histogram_count_reset_uploads_full_current_aggregates(self):
+        self.metric_store.set_histogram(
+            's1', count=15, sum_val=160.0, measurement_ts=10)
         self.collector.on_tick(self.watcher)
 
         # Writer restarted: count dropped, full current values are uploaded.
         self.uploader.upload_metric.reset_mock()
-        self.metric_store.set_summary(
-            's1', count=3, sum_val=10.0, sum2_val=40.0, measurement_ts=20)
+        self.metric_store.set_histogram(
+            's1', count=3, sum_val=10.0, measurement_ts=20)
         self.collector.on_tick(self.watcher)
         protos = self._uploaded_metrics()
         self.assertEqual(len(protos), 1)
         dp = protos[0].datapoints[0]
-        self.assertEqual(dp.summary.count, 3)
-        self.assertEqual(dp.summary.sum, 10.0)
-        self.assertEqual(dp.summary.sum2, 40.0)
+        self.assertEqual(dp.histogram.count, 3)
+        self.assertEqual(dp.histogram.sum, 10.0)
 
     def test_histogram_bin_deltas_uploaded(self):
         self.metric_store.set_histogram(
@@ -267,14 +298,13 @@ class CollectorTest(unittest.TestCase):
                          {id_a: 2, id_b: 1})
 
     def test_state_keyed_by_type_same_name_does_not_collide(self):
-        self.metric_store.set_summary(
-            'm1', count=2, sum_val=4.0, measurement_ts=10)
+        self.metric_store.set_counter('m1', 2, measurement_ts=10)
         self.metric_store.set_histogram(
             'm1', bins=[1], counts=[2], measurement_ts=10)
         self.collector.on_tick(self.watcher)
         types_uploaded = sorted(p.type for p in self._uploaded_metrics())
         self.assertEqual(types_uploaded, sorted([
-            signals_pb2.Metric.MetricType.SUMMARY_METRIC,
+            signals_pb2.Metric.MetricType.COUNTER_METRIC,
             signals_pb2.Metric.MetricType.HISTOGRAM_METRIC]))
 
         # Neither changed: nothing uploaded.

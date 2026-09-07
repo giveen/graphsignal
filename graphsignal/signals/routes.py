@@ -56,25 +56,32 @@ def _counter_stats(dp):
     return {'total': dp.get('total')}
 
 
-def _summary_stats(dp):
-    count = dp.get('count')
-    sum_val = dp.get('sum')
-    avg = None
-    if count and sum_val is not None:
-        avg = sum_val / count
-    return {'count': count, 'sum': sum_val, 'avg': avg}
-
-
 def _histogram_stats(dp):
+    """count/sum/min/max exactly as measured; mean, p50, p95 derived.
+
+    The exact totals win over the bins for the mean: a bin-weighted mean takes
+    every observation at its bin's lower bound, and the writer's own sum did
+    not. Quantiles have no such alternative — they only exist where there are
+    bins, and are null for a source that reports totals alone.
+    """
     bins = dp.get('bins')
     counts = dp.get('counts')
+    count = dp.get('count')
+    total = dp.get('sum')
     mean = None
-    if bins and counts and len(bins) == len(counts):
+    if count is not None and total is not None:
+        if count:
+            mean = total / count
+    elif bins and counts and len(bins) == len(counts):
         total_count = sum(counts)
         if total_count:
             mean = sum(b * c for b, c in zip(bins, counts)) / total_count
     quantiles = quantiles_from_bins(bins, counts) or {}
     return {
+        'count': count,
+        'sum': total,
+        'min': dp.get('min'),
+        'max': dp.get('max'),
         'mean': mean,
         'p50': quantiles.get('p50'),
         'p95': quantiles.get('p95'),
@@ -123,8 +130,6 @@ def build_payload():
             stats = _gauge_stats(metric.datapoint)
         elif metric.type == metrics_module.COUNTER:
             stats = _counter_stats(metric.datapoint)
-        elif metric.type == metrics_module.SUMMARY:
-            stats = _summary_stats(metric.datapoint)
         elif metric.type == metrics_module.HISTOGRAM:
             stats = _histogram_stats(metric.datapoint)
         else:

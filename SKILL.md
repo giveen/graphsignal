@@ -109,7 +109,8 @@ Then read `http://127.0.0.1:18259/signals` locally either way. On Linux, `docker
      "updated_ns": 1756150000000000000},
     {"name": "vllm:e2e_request_latency_seconds", "type": "histogram",
      "tags": {"process.pid": "123"},
-     "stats": {"mean": 0.42, "p50": 0.3, "p95": 1.5},
+     "stats": {"count": 1204, "sum": 505.68, "min": null, "max": null,
+               "mean": 0.42, "p50": 0.3, "p95": 1.5},
      "updated_ns": 1756150000000000000},
     {"name": "cuda_memcpy_bytes", "type": "counter",
      "tags": {"kind": "host_to_device", "process.pid": "123"},
@@ -137,8 +138,7 @@ Then read `http://127.0.0.1:18259/signals` locally either way. On Linux, `docker
 - `start_ns` is when this instance started — the base every cumulative stat accumulates from.
 - **gauge** — the latest sampled value (`stats.value`).
 - **counter** — cumulative total since `start_ns` (`stats.total`).
-- **summary** — cumulative `count`, `sum`, and derived `avg`.
-- **histogram** — a cumulative distribution: `mean`, `p50`, `p95` computed from its bins (quantiles are bin values; resolution ≤25%).
+- **histogram** — the one distribution type, cumulative: exact `count`, `sum`, `min`, `max` (`min`/`max` are lifetime extremes, and only sources that keep them report them — probes and the CUPTI/ROCm libraries do, Prometheus does not), `mean` (sum / count), and `p50`, `p95` computed from its bins (quantiles are bin values; resolution ≤25%). `sum / <iterations>` is the time per iteration of a probed region; `count` is how often it ran. A source with no buckets — a Prometheus summary — reports the totals with `p50`/`p95` as `null`; that is a whole histogram, not a broken one.
 - **profile** — cumulative counters per named frame (e.g. time per kernel) with the number of samples that produced each, as `stats.frames` sorted by value descending.
 - Metrics not updated for 10 minutes disappear from the report (dead workers age out).
 
@@ -149,7 +149,7 @@ Then read `http://127.0.0.1:18259/signals` locally either way. On Linux, `docker
 - `cuda_memcpy_nanoseconds` / `cuda_memset_nanoseconds` / `cuda_sync_nanoseconds` — profiles of cumulative time per transfer kind / sync type; `cuda_memcpy_bytes{kind}` / `cuda_memset_bytes{kind}` counters carry the volumes.
 - `gpu_*` — NVML telemetry per device (utilization, memory, power, clocks, throttling, NVLink/PCIe, `gpu_xid_critical_errors`).
 - `process_*`, `host_*` — CPU/memory per process and host.
-- Engine metrics scraped from Prometheus (vLLM `vllm:*`, SGLang `sglang:*`, TRT-LLM) appear under their original names — latency metrics as both a summary (count/sum) and a histogram (distribution) of the same name.
+- Engine metrics scraped from Prometheus (vLLM `vllm:*`, SGLang `sglang:*`, TRT-LLM) appear under their original names. Both `histogram` and `summary` families become one Graphsignal histogram: exact `count`/`sum` always, plus `p50`/`p95` where the family exposes `le` buckets.
 - User probe metrics (see GPU probes below) appear under their registered names.
 
 ### How to interpret (suggested order)
@@ -227,8 +227,9 @@ Conventions and semantics:
 - Values are unsigned 64-bit integers (nanoseconds, bytes, counts). Instruments are cumulative forever — never reset; readers snapshot and diff.
 - Name metrics with underscores and a unit suffix, like the built-ins: `myengine_batch_duration_nanoseconds`, `myengine_bytes_in`.
 - Give a rebuild two ticks before you read it. A newly registered probe reaches the shm file on the writer's next 1s tick and `/signals` on the recorder's next 1s tick — let the workload run ~3s before curling, or a probe that works looks like one that never registered.
+- Many device instruments (per block, per SM, per phase: hundreds or thousands) should come from one pool — `graphsignal_probe_cuda_pool_init(&pool, N)` once, then `graphsignal_probe_register_cuda_pooled(&pool, name, keys, vals, ntags)` per instrument. The pool is one `cudaMalloc`, and the profiler reads a contiguous pool with one copy per second instead of one per instrument (a thousand separate `graphsignal_probe_register_cuda` blocks cost a thousand driver round trips per write).
 - Registration can fail silently, and this is the one failure worth guarding. Past 4096 instruments per process (or on allocation failure) `graphsignal_probe_register` returns `NULL`, every record on it becomes a no-op, and nothing is logged — the only evidence is the `graphsignal_probe_dropped_instruments` counter in `/signals`. Register each instrument once at init; never register per call in a loop over shapes, layer names, or request ids.
-- Probes are inert without a reader. Under `graphsignal-run`, values appear in `/signals` automatically alongside the built-in metrics — histograms as summary + histogram stats, profiles as frames with values and sample counts.
+- Probes are inert without a reader. Under `graphsignal-run`, values appear in `/signals` automatically alongside the built-in metrics — histograms with exact `count`/`sum`/`min`/`max` plus bin quantiles, profiles as frames with values and sample counts.
 - Full instructions: https://graphsignal.com/docs/guides/gpu-probes/
 
 ## Production feedback loop (optional)
@@ -251,7 +252,7 @@ curl -s -H "X-API-Key: $GRAPHSIGNAL_API_KEY" \
   "https://api.graphsignal.com/api/v1/signals?instance_id=<id>&start=<epoch seconds>"
 ```
 
-`instance_id` is required (take it from `/api/v1/instances` or from the local payload's `context`). `start` is required: counters, summaries, histograms and profiles accumulate from that instant to the snapshot instant, rather than from run start — production instances can run longer than the server retains data. The payload echoes it as `start_ns`, where the local endpoint reports the instance start. Pass `end=<epoch seconds>` for a snapshot as of that moment instead of now. Consecutive reads tile without double counting when each passes the previous response's `payload_ns / 1e9` as its `start`.
+`instance_id` is required (take it from `/api/v1/instances` or from the local payload's `context`). `start` is required: counters, histograms and profiles accumulate from that instant to the snapshot instant, rather than from run start — production instances can run longer than the server retains data. The payload echoes it as `start_ns`, where the local endpoint reports the instance start. Pass `end=<epoch seconds>` for a snapshot as of that moment instead of now. Consecutive reads tile without double counting when each passes the previous response's `payload_ns / 1e9` as its `start`.
 
 
 ## Reporting issues

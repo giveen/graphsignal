@@ -67,8 +67,6 @@ class Collector:
                 self._collect_gauge(key, metric, global_tags)
             elif metric.type == metrics_module.COUNTER:
                 self._collect_counter(key, metric, global_tags)
-            elif metric.type == metrics_module.SUMMARY:
-                self._collect_summary(key, metric, global_tags)
             elif metric.type == metrics_module.HISTOGRAM:
                 self._collect_histogram(key, metric, global_tags)
             elif metric.type == metrics_module.PROFILE:
@@ -112,49 +110,48 @@ class Collector:
         proto_dp.measurement_ts = dp.get('ts') or 0
         self._uploader.upload_metric(proto)
 
-    def _collect_summary(self, key, metric, global_tags):
-        dp = metric.datapoint
-        count = dp.get('count') or 0
-        sum_val = dp.get('sum') or 0
-        sum2_val = dp.get('sum2') or 0
-
-        last = self._metric_state.get(key)
-        if last is not None and count >= last[0]:
-            d_count = count - last[0]
-            d_sum = sum_val - last[1]
-            d_sum2 = sum2_val - last[2]
-        else:
-            d_count, d_sum, d_sum2 = count, sum_val, sum2_val
-        self._metric_state[key] = (count, sum_val, sum2_val)
-        if d_count == 0:
-            return
-
-        proto = self._proto_metric(
-            signals_pb2.Metric.MetricType.SUMMARY_METRIC, metric, global_tags)
-        proto_dp = proto.datapoints.add()
-        proto_dp.summary.count = int(d_count)
-        proto_dp.summary.sum = d_sum
-        proto_dp.summary.sum2 = d_sum2
-        proto_dp.measurement_ts = dp.get('ts') or 0
-        self._uploader.upload_metric(proto)
-
     def _collect_histogram(self, key, metric, global_tags):
+        """Bin deltas and aggregate deltas, from whichever halves are present.
+
+        Bins and count/sum are deltaed independently: a source can report
+        either or both, and a bins-only tick must still upload when its buckets
+        moved. `min`/`max` are the exception — they are lifetime extremes of a
+        cumulative instrument, and the difference of two of them is not the
+        interval's extreme, so the current values are sent as they stand and
+        the platform folds them with min/max rather than a sum.
+        """
         dp = metric.datapoint
         bins = dp.get('bins') or []
         counts = dp.get('counts') or []
         current = dict(zip(bins, counts))
-        count = sum(counts)
+        bin_total = sum(counts)
+        count = dp.get('count')
+        sum_val = dp.get('sum')
 
         last = self._metric_state.get(key)
-        if last is not None and count >= last[0]:
+        last_bins = last['bins'] if last is not None else None
+        if last_bins is not None and bin_total >= last['bin_total']:
             delta_counts = {
-                bin_value: bin_count - last[1].get(bin_value, 0)
+                bin_value: bin_count - last_bins.get(bin_value, 0)
                 for bin_value, bin_count in current.items()
-                if bin_count > last[1].get(bin_value, 0)}
+                if bin_count > last_bins.get(bin_value, 0)}
         else:
             delta_counts = dict(current)
-        self._metric_state[key] = (count, current)
-        if not delta_counts:
+
+        d_count = d_sum = None
+        if count is not None and sum_val is not None:
+            last_count = last['count'] if last is not None else None
+            last_sum = last['sum'] if last is not None else None
+            if last_count is not None and last_sum is not None and count >= last_count:
+                d_count = count - last_count
+                d_sum = sum_val - last_sum
+            else:
+                d_count, d_sum = count, sum_val
+
+        self._metric_state[key] = {
+            'bin_total': bin_total, 'bins': current,
+            'count': count, 'sum': sum_val}
+        if not delta_counts and not d_count:
             return
 
         proto = self._proto_metric(
@@ -163,6 +160,13 @@ class Collector:
         for bin_value in sorted(delta_counts):
             proto_dp.histogram.bins.append(bin_value)
             proto_dp.histogram.counts.append(delta_counts[bin_value])
+        if d_count is not None:
+            proto_dp.histogram.count = int(d_count)
+            proto_dp.histogram.sum = d_sum
+        if dp.get('min') is not None:
+            proto_dp.histogram.min = dp['min']
+        if dp.get('max') is not None:
+            proto_dp.histogram.max = dp['max']
         proto_dp.measurement_ts = dp.get('ts') or 0
         self._uploader.upload_metric(proto)
 
