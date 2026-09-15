@@ -57,8 +57,8 @@ class FallbackLaunchTest(unittest.TestCase):
         self.launch_m.assert_called_once_with(
             ['/usr/bin/myapp', '--flag'],
             metrics_port=None, listen_host=None, listen_port=None)
-        self.cupti_env_m.assert_called_once_with()
-        self.rocm_env_m.assert_called_once_with()
+        self.cupti_env_m.assert_called_once_with(cuda_graph_trace=None)
+        self.rocm_env_m.assert_called_once_with(cuda_graph_trace=None)
 
     def test_explicit_metrics_port_forwarded(self):
         with patch.object(fallback_mod, '_resolve', return_value='/usr/bin/myapp'):

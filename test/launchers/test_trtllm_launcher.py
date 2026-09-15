@@ -26,8 +26,8 @@ class TrtllmLaunchTest(unittest.TestCase):
         with LaunchFixture(trtllm_mod) as fx:
             launcher.launch()
 
-        fx.cupti_env_m.assert_called_once_with()
-        fx.rocm_env_m.assert_called_once_with()
+        fx.cupti_env_m.assert_called_once_with(cuda_graph_trace=None)
+        fx.rocm_env_m.assert_called_once_with(cuda_graph_trace=None)
         fx.launch_supervised_m.assert_called_once_with(
             ['/abs/exec', '--model', 'm', '--port', '8000'],
             metrics_port=8000, metrics_path='/prometheus/metrics',

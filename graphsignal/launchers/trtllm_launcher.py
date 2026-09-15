@@ -28,8 +28,8 @@ class TrtllmLauncher(BaseLauncher):
                 'TRT-LLM gRPC mode has no HTTP /prometheus/metrics endpoint; '
                 'engine Prometheus metrics will not be scraped')
 
-        CuptiProfiler.setup_env_vars()
-        RocmProfiler.setup_env_vars()
+        CuptiProfiler.setup_env_vars(cuda_graph_trace=self.cuda_graph_trace)
+        RocmProfiler.setup_env_vars(cuda_graph_trace=self.cuda_graph_trace)
 
         metrics_port = resolve_metrics_port(
             self.metrics_port, self.args, default=DEFAULT_SERVE_PORT)

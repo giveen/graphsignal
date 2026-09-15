@@ -59,6 +59,22 @@ static graphsignal::Instrument* g_memcpy_profile = nullptr;
 static graphsignal::Instrument* g_memset_profile = nullptr;
 static graphsignal::Instrument* g_sync_profile = nullptr;
 
+// Reports the CUDA graph tracing granularity in effect (0 = graph, 1 = node).
+// Without it an empty cuda_graphs_nanoseconds is ambiguous: node mode, or a
+// workload that launches no graphs at all.
+static graphsignal::Instrument* g_graph_trace_mode_gauge = nullptr;
+
+// Graph tracing granularity for this process, set once by
+// cupti_activity_start. Read on the record path only to decide nothing — the
+// mode is expressed by which activity kinds are enabled — so a plain value is
+// enough.
+static uint32_t g_graph_trace_mode = GRAPHSIGNAL_GRAPH_TRACE_MODE_GRAPH;
+
+// An unrecognized GRAPHSIGNAL_CUDA_GRAPH_TRACE value, kept until the writer's
+// log ring exists (the variable is parsed in InitializeInjection, before the
+// writer is created). Fixed size: the native lib keeps all memory bounded.
+static char g_graph_trace_env_invalid[64] = {0};
+
 // graphId -> frame name (16-hex signature hash, or graph_<id> fallback).
 static std::unordered_map<uint32_t, std::string> g_graph_frames;
 
@@ -593,9 +609,16 @@ static void CUPTIAPI bufferCompleted(CUcontext ctx, uint32_t streamId, uint8_t* 
 
 } // namespace
 
-int cupti_activity_start(uint64_t write_interval_ns, uint32_t debug_mode) {
+int cupti_activity_start(uint64_t write_interval_ns, uint32_t debug_mode,
+                         uint32_t graph_trace_mode) {
   bool expected = false;
   if (!g_running.compare_exchange_strong(expected, true)) return 1;
+
+  // Anything unexpected degrades to the default granularity rather than
+  // leaving collection in an undefined state.
+  g_graph_trace_mode = (graph_trace_mode == GRAPHSIGNAL_GRAPH_TRACE_MODE_NODE)
+                           ? GRAPHSIGNAL_GRAPH_TRACE_MODE_NODE
+                           : GRAPHSIGNAL_GRAPH_TRACE_MODE_GRAPH;
 
   // The Writer owns the instruments, the log ring, the process context, and
   // the serialize thread. init never throws; nullptr means profiling stays
@@ -626,7 +649,11 @@ int cupti_activity_start(uint64_t write_interval_ns, uint32_t debug_mode) {
         graphsignal::InstrumentType::Profile, "cuda_memset_nanoseconds", {});
     g_sync_profile = writer->register_instrument(
         graphsignal::InstrumentType::Profile, "cuda_sync_nanoseconds", {});
+    g_graph_trace_mode_gauge = writer->register_instrument(
+        graphsignal::InstrumentType::Gauge, "cuda_graph_trace_mode", {});
   }
+  graphsignal::MetricsWriter::set(g_graph_trace_mode_gauge,
+                                  static_cast<double>(g_graph_trace_mode));
   {
     std::lock_guard<std::mutex> g(g_graph_sig_mu);
     g_graph_signatures.clear();
@@ -649,7 +676,16 @@ int cupti_activity_start(uint64_t write_interval_ns, uint32_t debug_mode) {
   // GRAPH_TRACE record instead). Lower overhead — same approach Nsight Systems
   // uses with --cuda-graph-trace=graph. Available since CUDA 12.4; if an older
   // CUPTI rejects it, CUPTI_CALL just logs and graph launches go unrecorded.
-  CUPTI_CALL(cuptiActivityEnable(CUPTI_ACTIVITY_KIND_GRAPH_TRACE));
+  //
+  // In NODE mode this enable is deliberately skipped: with GRAPH_TRACE off,
+  // CUPTI keeps instrumenting the graph's nodes and their kernels arrive
+  // through the CONCURRENT_KERNEL kind enabled above, landing in
+  // cuda_kernels_nanoseconds by symbol like eager launches. Nothing else
+  // changes, so an older CUPTI that rejects a kind cannot break the rest of
+  // collection either way.
+  if (g_graph_trace_mode == GRAPHSIGNAL_GRAPH_TRACE_MODE_GRAPH) {
+    CUPTI_CALL(cuptiActivityEnable(CUPTI_ACTIVITY_KIND_GRAPH_TRACE));
+  }
 
   // Observe CUDA graph instantiation so we can compute a stable structural
   // signature per executable graph (used to tag GRAPH_TRACE instruments across
@@ -663,8 +699,16 @@ int cupti_activity_start(uint64_t write_interval_ns, uint32_t debug_mode) {
 
   std::atexit([]() { cupti_activity_stop(); });
 
-  g_writer->debug("cupti_activity_start: write_interval_ns=%llu debug_mode=%u",
-                  static_cast<unsigned long long>(write_interval_ns), debug_mode);
+  if (g_graph_trace_env_invalid[0]) {
+    g_writer->debug(
+        "GRAPHSIGNAL_CUDA_GRAPH_TRACE=%s is not graph|node; using graph",
+        g_graph_trace_env_invalid);
+  }
+  g_writer->debug(
+      "cupti_activity_start: write_interval_ns=%llu debug_mode=%u "
+      "graph_trace_mode=%s",
+      static_cast<unsigned long long>(write_interval_ns), debug_mode,
+      g_graph_trace_mode == GRAPHSIGNAL_GRAPH_TRACE_MODE_NODE ? "node" : "graph");
   return 1;
 }
 
@@ -725,7 +769,28 @@ static uint32_t read_env_bool(const char* name) {
   return 0;
 }
 
+// Returns the variable's value, or `def` when unset or empty. The pointer is
+// getenv's — read it, never keep it.
+static const char* read_env_string(const char* name, const char* def) {
+  const char* s = std::getenv(name);
+  if (!s || !*s) return def;
+  return s;
+}
+
 extern "C" {
+
+uint32_t cupti_activity_graph_trace_mode_from_env(void) {
+  g_graph_trace_env_invalid[0] = '\0';
+  const char* s = read_env_string("GRAPHSIGNAL_CUDA_GRAPH_TRACE", nullptr);
+  if (!s) return GRAPHSIGNAL_GRAPH_TRACE_MODE_GRAPH;
+  if (std::strcmp(s, "node") == 0) return GRAPHSIGNAL_GRAPH_TRACE_MODE_NODE;
+  if (std::strcmp(s, "graph") == 0) return GRAPHSIGNAL_GRAPH_TRACE_MODE_GRAPH;
+  // Anything else: fall back to the default and keep the offending value for
+  // the debug note cupti_activity_start emits once the writer exists.
+  std::snprintf(g_graph_trace_env_invalid, sizeof(g_graph_trace_env_invalid),
+                "%s", s);
+  return GRAPHSIGNAL_GRAPH_TRACE_MODE_GRAPH;
+}
 
 CUptiResult InitializeInjection() {
   bool expected = false;
@@ -734,11 +799,12 @@ CUptiResult InitializeInjection() {
     return CUPTI_SUCCESS;
 
   const uint32_t debug_mode = read_env_bool("GRAPHSIGNAL_DEBUG");
+  const uint32_t graph_trace_mode = cupti_activity_graph_trace_mode_from_env();
 
   // Never let an exception (e.g. std::thread creation, bad_alloc) escape into
   // the CUDA driver's init path — that would std::terminate the workload.
   try {
-    cupti_activity_start(/*write_interval_ns=*/0, debug_mode);
+    cupti_activity_start(/*write_interval_ns=*/0, debug_mode, graph_trace_mode);
   } catch (...) {
     // Best-effort: profiling stays off; the workload runs unaffected.
   }

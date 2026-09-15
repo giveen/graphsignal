@@ -45,6 +45,7 @@ Leading flags (before the command):
 - `--metrics-port PORT` — where to scrape the engine's Prometheus metrics (default: derived from the engine's `--port`).
 - `--listen-host HOST` — host to bind the `/signals` endpoint to (default `127.0.0.1`; set e.g. `0.0.0.0` to expose it for remote access; also settable via `GRAPHSIGNAL_LISTEN_HOST`).
 - `--listen-port PORT` — port for the `/signals` endpoint (default `18259`; also settable via `GRAPHSIGNAL_LISTEN_PORT`).
+- `--cuda-graph-trace {graph|node}` — granularity for CUDA graph launches (default `graph`; also settable via `GRAPHSIGNAL_CUDA_GRAPH_TRACE`). `graph` times each graph replay as a whole into `cuda_graphs_nanoseconds`. `node` times the kernels *inside* the graph individually into `cuda_kernels_nanoseconds` and leaves `cuda_graphs_nanoseconds` empty — that is how you rank kernels in an engine that replays CUDA graphs (vLLM, SGLang, TensorRT-LLM, llama.cpp in decode). It needs no extra privileges; it costs more CUPTI work per replay, so use it for an investigation, not for a long-running production run. Ignored on ROCm, where every dispatch is reported individually anyway.
 
 Set `GRAPHSIGNAL_DEBUG=1` for verbose diagnostics.
 
@@ -59,7 +60,8 @@ One optimization iteration, for reference — not a prescription. Steps marked *
 5. Run a benchmark, or put representative load on the workload.
 6. Get signals from `/signals`.
 7. Identify bottlenecks (the read order below).
-8. Next iteration — keep what helped, revert what didn't.
+8. Next iteration — keep what helped, revert what didn't. Before recording a win, rebuild without probes and re-measure with
+   no `graphsignal-run` (see Overhead).
 
 ## Read signals
 
@@ -144,8 +146,9 @@ Then read `http://127.0.0.1:18259/signals` locally either way. On Linux, `docker
 
 ### Key metric families
 
-- `cuda_kernels_nanoseconds` / `rocm_kernels_nanoseconds` — profile of cumulative execution time per kernel (frames are raw mangled symbols).
-- `cuda_graphs_nanoseconds` — profile of cumulative replay time per unique CUDA-graph structure.
+- `cuda_kernels_nanoseconds` / `rocm_kernels_nanoseconds` — profile of cumulative execution time per kernel (frames are raw mangled symbols). **In the default graph mode this holds only eagerly launched kernels**: kernels replayed from a CUDA graph are reported as their graph instead. Rerun with `--cuda-graph-trace node` to get them here.
+- `cuda_graphs_nanoseconds` — profile of cumulative replay time per unique CUDA-graph structure (frames are 16-hex structural signatures). Empty in node mode.
+- `cuda_graph_trace_mode` — gauge, the graph tracing granularity in effect: `0` = graph (default), `1` = node. Read it before concluding anything from an empty `cuda_graphs_nanoseconds` or a sparse `cuda_kernels_nanoseconds`.
 - `cuda_memcpy_nanoseconds` / `cuda_memset_nanoseconds` / `cuda_sync_nanoseconds` — profiles of cumulative time per transfer kind / sync type; `cuda_memcpy_bytes{kind}` / `cuda_memset_bytes{kind}` counters carry the volumes.
 - `gpu_*` — NVML telemetry per device (utilization, memory, power, clocks, throttling, NVLink/PCIe, `gpu_xid_critical_errors`).
 - `process_*`, `host_*` — CPU/memory per process and host.
@@ -156,15 +159,49 @@ Then read `http://127.0.0.1:18259/signals` locally either way. On Linux, `docker
 
 1. Check `errors` first — a crash or XID error explains more than any metric.
 2. Check `gpu_utilization_percent` and `gpu_memory_*` per device — is the GPU busy, starved, or memory-bound?
-3. Read the `cuda_kernels_nanoseconds` and `cuda_graphs_nanoseconds` profiles — which frames dominate cumulative time (they are sorted descending)?
+3. Read the `cuda_kernels_nanoseconds` and `cuda_graphs_nanoseconds` profiles — which frames dominate cumulative time (they are sorted descending)? If the graph profile holds most of the GPU time and the kernel profile looks thin, the engine replays CUDA graphs and you are seeing whole replays; rerun with `--cuda-graph-trace node` to rank the kernels inside the graph. `cuda_graph_trace_mode` says which mode produced the payload you are reading.
 4. Check the `cuda_sync_nanoseconds` profile and `cuda_memcpy_nanoseconds` profile/byte counters — heavy host synchronization or transfer volume signals CPU/IO bottlenecks.
 5. Correlate with engine metrics (queue depth, running requests, token throughput) from the Prometheus import.
 
 Each read is the latest snapshot; trends come from diffing cumulative counts/sums between reads. When and how often to read is yours to decide — per benchmark run, per iteration, or continuously.
 
+## Overhead (and what it means for the numbers you report)
+
+Three collection modes, cheapest first. All three are privilege-free — none of them needs root, `CAP_SYS_ADMIN`, or a relaxed
+`RmProfilingAdminOnly`.
+
+| Mode | How | Cost | Use it |
+|---|---|---|---|
+| **Kernels** (default) | just `graphsignal-run` | on a GPU-bound workload, within run-to-run noise; a few percent at most on one that launches many small kernels per second | always, including long production runs |
+| **Graph node trace** | `--cuda-graph-trace node` | free on a GPU-bound workload; up to roughly ten percent on a host-bound one, because one record per replay becomes one per kernel inside it | to rank kernels in a graph-replaying engine, then switch back |
+| **GPU probes** | instrument the code | not measurable at production density (a few instruments per request/iteration); a few percent when dense enough to split one kernel into phases | **safe to ship in production**; dense instrumentation for investigation |
+
+Overhead tracks how often the workload asks the driver to do something, not model size: an engine that replays a whole decode
+step as one CUDA graph has almost nothing to record, while one that launches thousands of small kernels pays per record.
+Measured figures and the method: https://graphsignal.com/docs/guides/profiler-overhead/
+
+**Probes are safe to leave in production code.** The record path is lock-free and allocation-free (a few relaxed atomics), a
+record on a failed registration is a no-op, and instruments are inert when nothing reads them — a build carrying probes behaves
+the same whether or not a profiler is attached. So instrument the code once and ship it; there is no need to strip probes or keep
+a separate build. What costs something is *density*: a few instruments per request or per decode step is not measurable, while
+recording hundreds to thousands per iteration to split one kernel into phases costs a few percent.
+
+**Rules that keep your conclusions valid.** These matter more than the exact percentages:
+
+1. **A latency measured under the profiler is not the workload's latency.** Take the number you report — "the engine does X ms
+   per token" — from a run with no `graphsignal-run` and no probes. Use the profiled run to find *where* the time goes, not to
+   state how much there is.
+2. **Compare like with like.** A/B two candidate changes under identical conditions: same mode, same build flags, same prompt,
+   same warm-up. Never compare a probed build against an unprobed one, or a node-mode run against a default-mode one.
+3. **Re-measure without dense instrumentation.** When a change is kept, re-run the benchmark on a build without the dense
+   investigation probes before recording the win; that overhead can be larger than the improvement you are chasing. Probes left in
+   at production density do not need removing.
+4. **Say which mode produced a payload.** `cuda_graph_trace_mode` is in every payload for exactly this reason, and it explains an
+   empty `cuda_graphs_nanoseconds` or a thin `cuda_kernels_nanoseconds`.
+
 ## GPU probes (instrumenting code)
 
-The built-in `cuda_kernels_nanoseconds` profile already breaks time down per kernel symbol, for free. Probes are for what CUPTI structurally cannot see: the stages *inside* one kernel — a megakernel's phases, a fused op's steps — and anything whose name is a concept in your code rather than a linker symbol (per layer, per op, per request stage, queue depths). Reach for them when a built-in profile names the hot kernel and the next question is which part of it.
+The built-in `cuda_kernels_nanoseconds` profile already breaks time down per kernel symbol, for free — and `--cuda-graph-trace node` extends that to the kernels inside a CUDA graph. Probes are for what CUPTI structurally cannot see: the stages *inside* one kernel — a megakernel's phases, a fused op's steps — and anything whose name is a concept in your code rather than a linker symbol (per layer, per op, per request stage, queue depths). Reach for them when a built-in profile names the hot kernel and the next question is which part of it. They are safe to ship in production (see Overhead above); cost follows record density, so probe the one place you have already narrowed down to, and when the instrumentation is dense take headline numbers from a build without it.
 
 The probe API is a single vendorable header (Apache-2.0, C++17, no dependencies); an AI agent can insert probes, rebuild, rerun under `graphsignal-run`, and read the results from `/signals` in the same loop:
 
@@ -264,6 +301,8 @@ It is a profiler bug when the profiler itself misbehaves: it crashes or hangs, `
 It is **not** a profiler bug when: the workload itself fails (read `errors` and the console output — a CUDA OOM or an engine argument error is the workload's), a metric is `null` because nothing measured it (no GPU, no Prometheus endpoint, no `cu12`/`cu13` extra installed), `/signals` is unreachable because the workload already exited or is bound to another port, or a probe returned `NULL` at registration (check `graphsignal_probe_dropped_instruments`). Rule out all of these first — say which ones you ruled out in the report.
 
 Collect, and reproduce with `GRAPHSIGNAL_DEBUG=1` before writing it up:
+
+Include the profiler's own environment variables in the diagnostics — `GRAPHSIGNAL_DEBUG`, `GRAPHSIGNAL_CUDA_GRAPH_TRACE`, `GRAPHSIGNAL_LISTEN_HOST`/`GRAPHSIGNAL_LISTEN_PORT`, and whether `GRAPHSIGNAL_API_KEY` is set (never its value) — plus the `cuda_graph_trace_mode` gauge from the payload: a missing `cuda_graphs_nanoseconds` in node mode, or a thin `cuda_kernels_nanoseconds` in graph mode, is the profiler working as documented, not a bug.
 
 ```bash
 graphsignal-run --version

@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <sys/wait.h>
 #include <thread>
 #include <unistd.h>
 #include <vector>
@@ -194,6 +195,32 @@ static uint64_t frame_value_containing(const std::string& block,
   return 0;
 }
 
+// Sample count of the first frame whose name contains `sub`; 0 when absent.
+static uint64_t frame_samples_containing(const std::string& block,
+                                         const std::string& sub) {
+  for (const Frame& f : parse_frames(block)) {
+    if (f.name.find(sub) != std::string::npos) return f.samples;
+  }
+  return 0;
+}
+
+// True when some frame's name contains `sub`.
+static bool has_frame_containing(const std::string& block,
+                                 const std::string& sub) {
+  for (const Frame& f : parse_frames(block)) {
+    if (f.name.find(sub) != std::string::npos) return true;
+  }
+  return false;
+}
+
+// Value of a gauge metric block ("value":<double>); NaN-free double parse.
+static double block_double(const std::string& block, const char* field) {
+  const std::string m = std::string("\"") + field + "\":";
+  size_t p = block.find(m);
+  if (p == std::string::npos) return -1.0;
+  return std::strtod(block.c_str() + p + m.size(), nullptr);
+}
+
 // Sums the sparse "counts":[...] array of a histogram block.
 static uint64_t counts_total(const std::string& block) {
   const std::string m = "\"counts\":[";
@@ -266,7 +293,177 @@ __global__ void probe_record_kernel(graphsignal_instrument_data* inst,
   }
 }
 
-int main() {
+// ---------------------------------------------------------------------------
+// CUDA graph tracing granularity (GRAPHSIGNAL_CUDA_GRAPH_TRACE=graph|node).
+//
+// Both cases run in a re-exec'd child of this binary: the mode is read from the
+// environment before the library initializes and cannot be changed afterwards,
+// and each child needs its own CUPTI session and its own
+// /dev/shm/graphsignal_<pid>/cupti.json. fork() alone would inherit a
+// half-initialized CUDA context, so the child execs /proc/self/exe with the
+// scenario marker — same isolation intent as the probe test's forked cap case.
+// ---------------------------------------------------------------------------
+
+static const char* kGraphTraceMarker = "--graph-trace-scenario";
+
+// Kernel A once and kernel B once, captured into a graph, replayed
+// kGraphTraceReplays times, plus a single eager launch of A afterwards. The
+// eager launch is what separates the modes: in graph mode it is the only thing
+// cuda_kernels_nanoseconds may know about.
+static const int kGraphTraceReplays = 5;
+
+static int graph_trace_scenario() {
+  int device_count = 0;
+  if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count == 0) {
+    std::printf("graph-trace child: CUDA not available, skipping\n");
+    return 0;
+  }
+  if (cudaSetDevice(0) != cudaSuccess) {
+    std::fprintf(stderr, "graph-trace child: cudaSetDevice failed\n");
+    return 1;
+  }
+
+  // The env var is parsed by the library itself, so this exercises the real
+  // parse path (including the fallback for an unrecognized value).
+  const uint32_t mode = cupti_activity_graph_trace_mode_from_env();
+  const bool node_mode = (mode == GRAPHSIGNAL_GRAPH_TRACE_MODE_NODE);
+  std::printf("graph-trace child: GRAPHSIGNAL_CUDA_GRAPH_TRACE=%s -> mode=%s\n",
+              std::getenv("GRAPHSIGNAL_CUDA_GRAPH_TRACE")
+                  ? std::getenv("GRAPHSIGNAL_CUDA_GRAPH_TRACE")
+                  : "<unset>",
+              node_mode ? "node" : "graph");
+
+  const uint64_t write_interval_ns = 100'000'000ULL;  // 100ms
+  ASSERT(cupti_activity_start(write_interval_ns, /*debug_mode=*/1, mode) == 1,
+         "cupti_activity_start failed in graph-trace child");
+
+  const unsigned long long kBusyCycles = 2'000'000ULL;
+  int* d_sink = nullptr;
+  ASSERT(cudaMalloc(&d_sink, sizeof(int)) == cudaSuccess,
+         "cudaMalloc(d_sink) failed");
+
+  cudaStream_t cap_stream = nullptr;
+  ASSERT(cudaStreamCreate(&cap_stream) == cudaSuccess, "cap_stream create failed");
+  cudaGraph_t graph = nullptr;
+  cudaGraphExec_t graph_exec = nullptr;
+  ASSERT(cudaStreamBeginCapture(cap_stream, cudaStreamCaptureModeGlobal) == cudaSuccess,
+         "cudaStreamBeginCapture failed");
+  busy_wait_kernel_A<<<1, 32, 0, cap_stream>>>(d_sink, kBusyCycles);
+  busy_wait_kernel_B<<<1, 32, 0, cap_stream>>>(d_sink, kBusyCycles);
+  ASSERT(cudaStreamEndCapture(cap_stream, &graph) == cudaSuccess,
+         "cudaStreamEndCapture failed");
+  ASSERT(cudaGraphInstantiate(&graph_exec, graph, 0) == cudaSuccess,
+         "cudaGraphInstantiate failed");
+  for (int i = 0; i < kGraphTraceReplays; ++i) {
+    ASSERT(cudaGraphLaunch(graph_exec, cap_stream) == cudaSuccess,
+           "cudaGraphLaunch failed");
+  }
+  ASSERT(cudaStreamSynchronize(cap_stream) == cudaSuccess, "graph stream sync failed");
+
+  // One eager launch of A, outside any graph.
+  busy_wait_kernel_A<<<1, 32, 0, cap_stream>>>(d_sink, kBusyCycles);
+  ASSERT(cudaGetLastError() == cudaSuccess, "eager launch failed");
+  ASSERT(cudaStreamSynchronize(cap_stream) == cudaSuccess, "eager sync failed");
+
+  cudaGraphExecDestroy(graph_exec);
+  cudaGraphDestroy(graph);
+
+  // Several writer intervals; every write force-flushes CUPTI first.
+  std::this_thread::sleep_for(std::chrono::milliseconds(700));
+
+  const std::string json = read_file(shm_json_path());
+  ASSERT(!json.empty(), "cupti.json should exist in the graph-trace child");
+
+  // --- the mode gauge explains the rest of the payload.
+  {
+    const auto blocks = find_metric_blocks(json, "cuda_graph_trace_mode");
+    ASSERT(blocks.size() == 1, "cuda_graph_trace_mode gauge missing");
+    ASSERT(blocks[0].find("\"type\":\"gauge\"") != std::string::npos,
+           "cuda_graph_trace_mode must serialize as a gauge");
+    const double value = block_double(blocks[0], "value");
+    std::printf("cuda_graph_trace_mode=%g\n", value);
+    ASSERT(value == (node_mode ? 1.0 : 0.0),
+           "cuda_graph_trace_mode must report the mode in effect");
+  }
+
+  const auto kernel_blocks = find_metric_blocks(json, "cuda_kernels_nanoseconds");
+  ASSERT(kernel_blocks.size() == 1, "cuda_kernels_nanoseconds profile missing");
+  const auto graph_blocks = find_metric_blocks(json, "cuda_graphs_nanoseconds");
+  ASSERT(graph_blocks.size() == 1, "cuda_graphs_nanoseconds profile missing");
+
+  const uint64_t samples_a = frame_samples_containing(kernel_blocks[0], "busy_wait_kernel_A");
+  const uint64_t samples_b = frame_samples_containing(kernel_blocks[0], "busy_wait_kernel_B");
+  const auto graph_frames = parse_frames(graph_blocks[0]);
+  std::printf("graph-trace child: kernel samples A=%llu B=%llu, graph frames=%zu\n",
+              static_cast<unsigned long long>(samples_a),
+              static_cast<unsigned long long>(samples_b), graph_frames.size());
+
+  if (node_mode) {
+    // NODE mode: the graph's nodes are instrumented, so both kernels show up
+    // as ordinary kernels — A once per replay plus the eager launch, B once
+    // per replay — and nothing is reported at graph granularity.
+    ASSERT_EQ(samples_a, static_cast<uint64_t>(kGraphTraceReplays + 1),
+              "node mode: kernel A must be sampled once per replay plus the eager launch");
+    ASSERT_EQ(samples_b, static_cast<uint64_t>(kGraphTraceReplays),
+              "node mode: kernel B must be sampled once per replay");
+    ASSERT(frame_value_containing(kernel_blocks[0], "busy_wait_kernel_A") > 0,
+           "node mode: kernel A must carry a duration");
+    ASSERT(frame_value_containing(kernel_blocks[0], "busy_wait_kernel_B") > 0,
+           "node mode: kernel B must carry a duration");
+    ASSERT(graph_frames.empty(),
+           "node mode: cuda_graphs_nanoseconds must stay empty");
+  } else {
+    // GRAPH mode: one record per replay, aggregated into a single structural
+    // frame; the graph's kernels are not reported individually, so only the
+    // eager launch of A reaches cuda_kernels_nanoseconds and B is absent.
+    ASSERT_EQ(graph_frames.size(), static_cast<size_t>(1),
+              "graph mode: exactly one graph frame expected");
+    ASSERT_EQ(graph_frames[0].samples, static_cast<uint64_t>(kGraphTraceReplays),
+              "graph mode: the graph frame must count every replay");
+    ASSERT(graph_frames[0].value > 0, "graph mode: graph frame duration must be > 0");
+    ASSERT_EQ(samples_a, 1ull,
+              "graph mode: only the eager launch of kernel A may be sampled");
+    ASSERT(!has_frame_containing(kernel_blocks[0], "busy_wait_kernel_B"),
+           "graph mode: a graph-only kernel must not appear in cuda_kernels_nanoseconds");
+  }
+
+  cudaStreamDestroy(cap_stream);
+  cudaFree(d_sink);
+  cupti_activity_stop();
+  std::printf("graph-trace child (%s mode) passed\n", node_mode ? "node" : "graph");
+  return 0;
+}
+
+// Runs the scenario in a re-exec'd child with GRAPHSIGNAL_CUDA_GRAPH_TRACE set
+// to `env_value` (nullptr = leave it unset, i.e. the default mode).
+static void run_graph_trace_child(const char* env_value) {
+  std::printf("--- graph-trace child: GRAPHSIGNAL_CUDA_GRAPH_TRACE=%s\n",
+              env_value ? env_value : "<unset>");
+  pid_t pid = fork();
+  ASSERT(pid >= 0, "fork must succeed");
+  if (pid == 0) {
+    if (env_value) {
+      setenv("GRAPHSIGNAL_CUDA_GRAPH_TRACE", env_value, 1);
+    } else {
+      unsetenv("GRAPHSIGNAL_CUDA_GRAPH_TRACE");
+    }
+    char arg0[] = "cupti_activity_test";
+    char arg1[] = "--graph-trace-scenario";
+    char* const child_argv[] = {arg0, arg1, nullptr};
+    execv("/proc/self/exe", child_argv);
+    _exit(127);  // execv only returns on failure
+  }
+  int status = 0;
+  ASSERT(waitpid(pid, &status, 0) == pid, "waitpid must return the child");
+  ASSERT(WIFEXITED(status), "graph-trace child must exit normally");
+  ASSERT_EQ(WEXITSTATUS(status), 0, "graph-trace child must exit 0");
+}
+
+int main(int argc, char** argv) {
+  if (argc > 1 && std::strcmp(argv[1], kGraphTraceMarker) == 0) {
+    return graph_trace_scenario();
+  }
+
   int device_count = 0;
   cudaError_t cuda_status = cudaGetDeviceCount(&device_count);
   if (cuda_status != cudaSuccess || device_count == 0) {
@@ -275,6 +472,13 @@ int main() {
   }
   std::printf("CUDA available, testing with actual kernel and memcpy operations...\n");
   ASSERT(cudaSetDevice(0) == cudaSuccess, "cudaSetDevice failed");
+
+  // CUDA graph tracing granularity, before this process starts its own CUPTI
+  // session: each case is a separate re-exec'd process with its own
+  // environment, CUPTI session and shm file.
+  run_graph_trace_child(nullptr);   // default: GRAPH granularity
+  run_graph_trace_child("node");    // opt-in: NODE granularity
+  run_graph_trace_child("nodes");   // invalid: falls back to GRAPH
 
   // HOST-storage probe, registered before profiling starts. The writer reads
   // the registry on every serialize, so it appears in cupti.json.
@@ -295,7 +499,8 @@ int main() {
   graphsignal_profile_add_by_name(host_profile, "stage.decode", 333);
 
   const uint64_t write_interval_ns = 100'000'000ULL;  // 100ms
-  ASSERT(cupti_activity_start(write_interval_ns, /*debug_mode=*/1) == 1,
+  ASSERT(cupti_activity_start(write_interval_ns, /*debug_mode=*/1,
+                              GRAPHSIGNAL_GRAPH_TRACE_MODE_GRAPH) == 1,
          "cupti_activity_start failed");
   ASSERT(cupti_activity_get_debug_mode() == 1, "debug mode should be on");
   cupti_activity_set_debug_mode(0);

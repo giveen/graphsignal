@@ -15,7 +15,13 @@ class CuptiProfiler:
     """
 
     @staticmethod
-    def setup_env_vars() -> bool:
+    def setup_env_vars(cuda_graph_trace: Optional[str] = None) -> bool:
+        # Set the graph-trace mode before the platform/CUDA checks: the native
+        # library reads GRAPHSIGNAL_CUDA_GRAPH_TRACE at injection time, and the
+        # flag must win over an inherited value regardless of whether this
+        # process ends up finding CUPTI.
+        _set_cuda_graph_trace(cuda_graph_trace)
+
         if not sys.platform.startswith("linux"):
             logger.debug("CUPTI not supported on this platform")
             return False
@@ -40,6 +46,23 @@ class CuptiProfiler:
 
         logger.debug("CUPTI env setup complete (cuda %s)", cuda_major)
         return True
+
+
+CUDA_GRAPH_TRACE_ENV_VAR = "GRAPHSIGNAL_CUDA_GRAPH_TRACE"
+
+
+def _set_cuda_graph_trace(cuda_graph_trace: Optional[str]) -> None:
+    """Publish the graph-trace mode to the workload's environment.
+
+    `graphsignal-run --cuda-graph-trace` beats a value inherited from the
+    environment; with no flag, whatever was inherited is left alone so the
+    variable stays usable on its own. The native library validates the value
+    and falls back to `graph`, so nothing is rejected here.
+    """
+    if not cuda_graph_trace:
+        return
+    os.environ[CUDA_GRAPH_TRACE_ENV_VAR] = cuda_graph_trace
+    logger.debug("%s=%s", CUDA_GRAPH_TRACE_ENV_VAR, cuda_graph_trace)
 
 
 def _packaged_cupti_so_path() -> Optional[str]:

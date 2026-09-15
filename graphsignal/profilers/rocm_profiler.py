@@ -24,7 +24,15 @@ class RocmProfiler:
     """
 
     @staticmethod
-    def setup_env_vars() -> bool:
+    def setup_env_vars(cuda_graph_trace: Optional[str] = None) -> bool:
+        if cuda_graph_trace:
+            # Accepted and ignored. rocprofiler-sdk reports every kernel
+            # dispatch individually, graph-replayed ones included, so there is
+            # no graph-vs-node granularity to select on ROCm.
+            logger.debug(
+                "--cuda-graph-trace=%s ignored on ROCm: rocprofiler-sdk reports "
+                "kernel dispatches individually", cuda_graph_trace)
+
         if not sys.platform.startswith("linux"):
             logger.debug("ROCm not supported on this platform")
             return False

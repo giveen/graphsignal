@@ -68,6 +68,7 @@ Options (before the command):
 | `--metrics-port PORT` | Port to scrape the engine's Prometheus metrics on (default: derived from the engine's `--port`). |
 | `--listen-host HOST` | Host to bind the `/signals` endpoint to (default: `127.0.0.1`). Set e.g. `0.0.0.0` to expose it for remote access — anything on that network can then read it. |
 | `--listen-port PORT` | Port for the `/signals` endpoint (default: `18259`). |
+| `--cuda-graph-trace {graph\|node}` | Granularity for CUDA graph launches (default: `graph`). `graph` times each replay as a whole into `cuda_graphs_nanoseconds`; `node` times the kernels inside the graph individually into `cuda_kernels_nanoseconds`. Also settable via `GRAPHSIGNAL_CUDA_GRAPH_TRACE`; the flag wins. |
 
 Engine notes: the SGLang launcher adds `--enable-metrics` so the Prometheus endpoint is available; the vLLM launcher removes `--disable-log-stats` for the same reason. Everything else on the command line is passed through unchanged.
 
@@ -90,6 +91,8 @@ The response contains:
 `null` means not measured; `0` means measured zero. The endpoint lives as long as the profiled workload.
 
 The endpoint is what closes the loop: an AI agent launches the workload under `graphsignal-run`, polls `/signals` under load, reads which kernels, transfers, or synchronization dominate, changes flags or code, and measures again. [SKILL.md](SKILL.md) teaches an agent the payload semantics and how to interpret it; see the [AI Optimization guide](https://graphsignal.com/docs/guides/ai-optimization/) for the full workflow.
+
+Engines that capture their decode step into a CUDA graph — vLLM, SGLang, TensorRT-LLM, llama.cpp — replay one graph per token, so by default their decode time arrives as whole replays in `cuda_graphs_nanoseconds` and `cuda_kernels_nanoseconds` holds only the eager (prefill) kernels. When the loop needs a per-kernel ranking, relaunch with `--cuda-graph-trace node`: the same kernels then appear in `cuda_kernels_nanoseconds` by symbol, `cuda_graphs_nanoseconds` goes empty, and the `cuda_graph_trace_mode` gauge records which granularity produced the payload. It needs no elevated privileges — it is an investigation mode, not a deployment default (see Overhead).
 
 
 ## GPU probes
@@ -182,8 +185,15 @@ Uploaded signals are read back with the same API key: `GET /api/v1/instances` li
 
 ## Overhead
 
-GPU activity is collected with low-overhead CUPTI/ROCm activity APIs inside the workload process; everything else — analysis, statistics, the HTTP endpoint — runs in the sidecar profiler process.
+GPU activity is collected with low-overhead CUPTI/ROCm activity APIs inside the workload process; everything else — analysis, statistics, the HTTP endpoint — runs in the sidecar profiler process. Nothing here needs root or GPU profiling privileges.
 
+Three collection modes, in the order you should reach for them:
+
+* **Kernels** (default) — just `graphsignal-run`. Cheap enough to leave on, including in production.
+* **Graph node trace** — `--cuda-graph-trace node`, when the default mode puts all the GPU time in `cuda_graphs_nanoseconds` and you need it per kernel. Run it for the investigation, then go back to the default.
+* **GPU probes** — instrument the code with [probe.h](include/graphsignal/probe.h), once a kernel is named and the question is which part of it. Safe to leave in production; cost follows how densely you record.
+
+What each mode costs, measured, and the method behind the numbers: [Profiler Overhead guide](https://graphsignal.com/docs/guides/profiler-overhead/).
 
 ## Security and privacy
 

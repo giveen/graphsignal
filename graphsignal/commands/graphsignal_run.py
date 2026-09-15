@@ -40,6 +40,13 @@ Options (must precede the command):
   --listen-port PORT
                   Port for the watcher's local /signals HTTP endpoint
                   (default: 18259).
+  --cuda-graph-trace {graph|node}
+                  Granularity for CUDA graph launches (default: graph).
+                  `graph` records one timing per graph replay in
+                  cuda_graphs_nanoseconds. `node` records the kernels inside
+                  the graph individually in cuda_kernels_nanoseconds, at
+                  higher CUPTI cost. Also settable via
+                  GRAPHSIGNAL_CUDA_GRAPH_TRACE; the flag wins.
 
 Example:
   graphsignal-run vllm serve facebook/opt-125m --port 8001
@@ -50,11 +57,15 @@ Example:
 """
 
 
+CUDA_GRAPH_TRACE_MODES = ('graph', 'node')
+
+
 def _extract_graphsignal_flags(argv):
     """Pull graphsignal-run's own flags out of argv before the workload command.
 
     `--metrics-port` specifies the Prometheus scrape port.
     `--listen-host`/`--listen-port` specify the /signals endpoint bind address.
+    `--cuda-graph-trace` selects the CUDA graph tracing granularity.
     All are consumed here and never forwarded to the workload. Only leading
     flags (before the workload command) are parsed, so identically named
     workload flags later in argv are left untouched.
@@ -62,6 +73,7 @@ def _extract_graphsignal_flags(argv):
     metrics_port = None
     listen_host = None
     listen_port = None
+    cuda_graph_trace = None
     i = 0
     while i < len(argv):
         arg = argv[i]
@@ -98,8 +110,19 @@ def _extract_graphsignal_flags(argv):
             listen_port = _parse_port('--listen-port', arg.split('=', 1)[1])
             i += 1
             continue
+        if arg == '--cuda-graph-trace':
+            if i + 1 >= len(argv):
+                print("graphsignal-run: --cuda-graph-trace requires a value\n")
+                sys.exit(1)
+            cuda_graph_trace = _parse_cuda_graph_trace(argv[i + 1])
+            i += 2
+            continue
+        if arg.startswith('--cuda-graph-trace='):
+            cuda_graph_trace = _parse_cuda_graph_trace(arg.split('=', 1)[1])
+            i += 1
+            continue
         break
-    return metrics_port, listen_host, listen_port, argv[i:]
+    return metrics_port, listen_host, listen_port, cuda_graph_trace, argv[i:]
 
 
 def _parse_port(flag, value):
@@ -108,6 +131,15 @@ def _parse_port(flag, value):
     except (TypeError, ValueError):
         print("graphsignal-run: invalid %s value: %s\n" % (flag, value))
         sys.exit(1)
+
+
+def _parse_cuda_graph_trace(value):
+    mode = (value or '').strip().lower()
+    if mode not in CUDA_GRAPH_TRACE_MODES:
+        print("graphsignal-run: invalid --cuda-graph-trace value: %s (expected %s)\n"
+              % (value, '|'.join(CUDA_GRAPH_TRACE_MODES)))
+        sys.exit(1)
+    return mode
 
 
 def main():
@@ -126,12 +158,15 @@ def main():
 
     _setup_logging()
 
-    metrics_port, listen_host, listen_port, target_args = _extract_graphsignal_flags(sys.argv[1:])
-    log.debug('graphsignal-run target args: %s (metrics_port=%s, listen_host=%s, listen_port=%s)',
-              target_args, metrics_port, listen_host, listen_port)
+    (metrics_port, listen_host, listen_port, cuda_graph_trace,
+     target_args) = _extract_graphsignal_flags(sys.argv[1:])
+    log.debug('graphsignal-run target args: %s (metrics_port=%s, listen_host=%s, '
+              'listen_port=%s, cuda_graph_trace=%s)',
+              target_args, metrics_port, listen_host, listen_port, cuda_graph_trace)
 
     launcher_kwargs = dict(
-        metrics_port=metrics_port, listen_host=listen_host, listen_port=listen_port)
+        metrics_port=metrics_port, listen_host=listen_host, listen_port=listen_port,
+        cuda_graph_trace=cuda_graph_trace)
     launchers = [
         VllmLauncher(target_args, **launcher_kwargs),
         SglangLauncher(target_args, **launcher_kwargs),
