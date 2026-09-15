@@ -25,7 +25,10 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
+          # 3.11+ for `tomllib` in the version check below. The wheel is pure
+          # Python plus committed native libraries, so this version only runs
+          # the release steps; the supported range is tested by test.yml.
+          python-version: '3.12'
 
       - name: Check the tag against both places the version is written
         # The version lives in pyproject.toml AND graphsignal/version.py, and
