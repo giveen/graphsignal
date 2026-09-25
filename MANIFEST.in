@@ -1,5 +1,2 @@
-include README.md
-include LICENSE
-include NOTICE
-recursive-include graphsignal/_native *
-recursive-include include *.h
+# This project builds with poetry-core and does not use setuptools MANIFEST.in.
+# Native sources and build files are included in the sdist through pyproject.toml.

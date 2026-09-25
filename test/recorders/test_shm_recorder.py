@@ -228,25 +228,55 @@ class ShmRecorderImportTest(unittest.TestCase):
         self.assertIsNone(
             find_metric(self.watcher.metric_store().export(), 'x_gauge'))
 
-    def test_log_entries_reemitted_at_debug_and_deduped_by_ts(self):
-        self._write_file(self._payload(
-            log=[{'ts': 1000, 'msg': 'hello from workload'}]))
+    def test_warning_and_error_entries_stored_and_all_entries_deduped(self):
+        entries = [
+            {'ts': 1000, 'level': 'warning', 'msg': 'profiler warning'},
+            {'ts': 2000, 'level': 'error', 'msg': 'profiler error'},
+            {'ts': 3000, 'level': 'debug', 'msg': 'profiler debug'},
+        ]
+        self._write_file(self._payload(log=entries))
 
         with self.assertLogs('graphsignal', level='DEBUG') as cm:
             self.recorder.on_tick()
             self.recorder.on_tick()
-        hits = [m for m in cm.output if 'hello from workload' in m]
-        self.assertEqual(len(hits), 1)
 
-        # A newer log entry is emitted; the old one stays deduped.
-        self._write_file(self._payload(
-            log=[{'ts': 1000, 'msg': 'hello from workload'},
-                 {'ts': 2000, 'msg': 'second line'}]))
+        # Every new native entry is still available in the debug log.
+        for message in ('profiler warning', 'profiler error', 'profiler debug'):
+            self.assertEqual(
+                len([m for m in cm.output if message in m]), 1)
+
+        # Warning/error entries are exposed through the watcher's LogStore;
+        # debug remains a debug diagnostic only.
+        stored = [e for e in self.watcher.log_store().export()
+                  if e['tags'].get('scope.name') == 'profiler']
+        self.assertEqual(len(stored), 2)
+        self.assertEqual(
+            [(e['level'], e['message'], e['ts']) for e in stored],
+            [('warning', 'profiler warning', 1000),
+             ('error', 'profiler error', 2000)])
+        for entry in stored:
+            self.assertEqual(entry['tags'], {
+                'process.pid': str(self.pid),
+                'scope.name': 'profiler',
+            })
+
+        # The retained ring may repeat old entries. They stay deduped, while a
+        # newly appended warning/error is imported once.
+        self._write_file(self._payload(log=entries + [
+            {'ts': 4000, 'level': 'error', 'msg': 'new profiler error'}]))
         with self.assertLogs('graphsignal', level='DEBUG') as cm:
             self.recorder.on_tick()
         self.assertEqual(
-            len([m for m in cm.output if 'hello from workload' in m]), 0)
-        self.assertEqual(len([m for m in cm.output if 'second line' in m]), 1)
+            len([m for m in cm.output if 'profiler warning' in m]), 0)
+        self.assertEqual(
+            len([m for m in cm.output if 'new profiler error' in m]), 1)
+
+        stored = [e for e in self.watcher.log_store().export()
+                  if e['tags'].get('scope.name') == 'profiler']
+        self.assertEqual(len(stored), 3)
+        self.assertEqual(stored[-1]['level'], 'error')
+        self.assertEqual(stored[-1]['message'], 'new profiler error')
+        self.assertEqual(stored[-1]['ts'], 4000)
 
     def test_shutdown_removes_own_dir(self):
         self.assertTrue(os.path.isdir(self.shm_dir))

@@ -1,12 +1,12 @@
-import unittest
-import graphsignal.watcher
-from graphsignal import version
-from graphsignal.signals.routes import build_payload, quantiles_from_bins
-from test.test_utils import configure_test_watcher
 import json
+import unittest
 import urllib.error
 import urllib.request
-from graphsignal.signals.routes import SignalsEndpoint
+
+import graphsignal.watcher
+from graphsignal import version
+from graphsignal.signals.routes import (
+    SignalsEndpoint, build_payload, quantiles_from_bins)
 from test.test_utils import configure_test_watcher, free_port
 
 
@@ -204,10 +204,6 @@ class BuildPayloadUnconfiguredTest(unittest.TestCase):
         self.assertEqual(payload['profiler'], {'version': version.__version__})
         self.assertGreater(payload['payload_ns'], 0)
         self.assertIsNone(payload['start_ns'])
-
-
-if __name__ == '__main__':
-    unittest.main()
 
 
 class SignalsEndpointTest(unittest.TestCase):

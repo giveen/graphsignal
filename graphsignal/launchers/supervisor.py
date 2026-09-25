@@ -13,6 +13,50 @@ from graphsignal.launchers.command_utils import start_watcher
 
 logger = logging.getLogger('graphsignal')
 
+# Watchers normally notice that their target has exited and exit on their own.
+# Keep cleanup bounded so a stuck watcher cannot keep the supervisor alive.
+_WATCHER_EXIT_TIMEOUT = 0.5
+_WATCHER_TERMINATE_TIMEOUT = 1.0
+
+
+def _stop_watcher(watcher: Optional[subprocess.Popen]) -> None:
+    """Stop a watcher after the target exits, without delaying natural exit.
+
+    ``start_watcher`` is best-effort and may return ``None``.  A watcher that
+    exits naturally is left alone; otherwise it is terminated, given a short
+    grace period, and killed only if it still does not exit.  Cleanup errors
+    must not affect the target's status.
+    """
+    if watcher is None:
+        return
+    try:
+        watcher.wait(timeout=_WATCHER_EXIT_TIMEOUT)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    except (OSError, ValueError):
+        return
+
+    try:
+        watcher.terminate()
+    except (OSError, ValueError):
+        return
+
+    try:
+        watcher.wait(timeout=_WATCHER_TERMINATE_TIMEOUT)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    except (OSError, ValueError):
+        return
+
+    try:
+        watcher.kill()
+        watcher.wait()
+    except (OSError, ValueError):
+        pass
+
+
 # Base dir for console capture; capture is disabled when it doesn't exist
 # (e.g. macOS). Tests patch this to a temp dir.
 _SHM_BASE = '/dev/shm'
@@ -251,14 +295,15 @@ def launch_supervised(argv: List[str], *,
             drain_threads.append(thread)
 
     logger.debug('Supervising target pid=%s: %s', target.pid, argv)
-    start_watcher(target.pid,
-                  metrics_port=metrics_port,
-                  metrics_path=metrics_path,
-                  metrics_host=metrics_host,
-                  listen_host=listen_host,
-                  listen_port=listen_port)
+    watcher = start_watcher(target.pid,
+                            metrics_port=metrics_port,
+                            metrics_path=metrics_path,
+                            metrics_host=metrics_host,
+                            listen_host=listen_host,
+                            listen_port=listen_port)
 
     rc = target.wait()
+    _stop_watcher(watcher)
 
     # Pipes hit EOF once the target (and any fd-inheriting descendants) exit.
     for thread in drain_threads:

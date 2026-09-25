@@ -127,10 +127,14 @@ def _extract_graphsignal_flags(argv):
 
 def _parse_port(flag, value):
     try:
-        return int(value)
+        port = int(value)
     except (TypeError, ValueError):
-        print("graphsignal-run: invalid %s value: %s\n" % (flag, value))
+        port = 0
+    if not 1 <= port <= 65535:
+        print("graphsignal-run: invalid %s value: %s (expected 1-65535)\n"
+              % (flag, value))
         sys.exit(1)
+    return port
 
 
 def _parse_cuda_graph_trace(value):

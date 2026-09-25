@@ -3,6 +3,7 @@ import subprocess
 import sys
 import time
 import unittest
+from unittest.mock import patch
 
 from graphsignal.watcher.pid_monitor import PidMonitor
 
@@ -32,6 +33,64 @@ class _RecordingListener:
 
 
 class PidMonitorTest(unittest.TestCase):
+    def test_create_time_mismatch_treats_reused_pid_as_terminated(self):
+        class _Process:
+            def __init__(self, create_times):
+                self._create_times = iter(create_times)
+
+            def is_running(self):
+                return True
+
+            def status(self):
+                return 'running'
+
+            def create_time(self):
+                return next(self._create_times)
+
+            def children(self, recursive=True):
+                return []
+
+            def cmdline(self):
+                return ['python', 'target.py']
+
+        listener = _RecordingListener()
+        monitor = PidMonitor(target_pid=1234)
+        monitor.add_listener(listener)
+        process = _Process([100.0, 200.0])
+        with patch('graphsignal.watcher.pid_monitor.psutil.Process', return_value=process):
+            monitor._tick()
+            monitor._tick()
+
+        self.assertEqual(listener.created, 1)
+        self.assertEqual(listener.terminated, 1)
+
+    def test_matching_create_time_keeps_target_alive(self):
+        class _Process:
+            def is_running(self):
+                return True
+
+            def status(self):
+                return 'running'
+
+            def create_time(self):
+                return 100.0
+
+            def children(self, recursive=True):
+                return []
+
+            def cmdline(self):
+                return ['python', 'target.py']
+
+        listener = _RecordingListener()
+        monitor = PidMonitor(target_pid=1234)
+        monitor.add_listener(listener)
+        with patch('graphsignal.watcher.pid_monitor.psutil.Process', return_value=_Process()):
+            monitor._tick()
+            monitor._tick()
+
+        self.assertEqual(listener.created, 1)
+        self.assertEqual(listener.terminated, 0)
+
     def test_on_target_known_emitted_at_setup_before_polling(self):
         # on_target_known fires synchronously from setup(), so a consumer of a
         # pid-derived artifact is wired up even if the target never polls alive.

@@ -10,7 +10,6 @@ library is loaded into the workload.
 
 import json
 import os
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -178,12 +177,11 @@ class GraphsignalRunCudaE2ETest(unittest.TestCase):
                 with open(output_path) as f:
                     trail = f.read()
 
-            # The native CUPTI injection library can SIGSEGV on teardown (-11)
-            # on some platforms. That's a native-side cleanup issue independent
-            # of the workload running correctly, so we accept either a clean
-            # exit or a SIGSEGV *as long as* the workload reached 'done'.
-            self.assertIn(
-                proc.returncode, (0, -11),
+            if proc.returncode == -11:
+                self.skipTest(
+                    'CUPTI injection library crashed during native teardown')
+            self.assertEqual(
+                proc.returncode, 0,
                 msg=(f"graphsignal-run exited unexpectedly with "
                      f"returncode={proc.returncode};\n"
                      f"--- trail ---\n{trail}\n"
@@ -214,14 +212,6 @@ class GraphsignalRunCudaE2ETest(unittest.TestCase):
             os.unlink(script)
             if os.path.exists(output_path):
                 os.unlink(output_path)
-            # Best-effort: clean up any lingering shm dir left by the workload.
-            for entry in os.listdir('/dev/shm') if os.path.isdir('/dev/shm') else ():
-                if entry.startswith('graphsignal_'):
-                    try:
-                        shutil.rmtree(os.path.join('/dev/shm', entry), ignore_errors=True)
-                    except Exception:
-                        pass
-
             # Give the detached watcher subprocess a moment to notice its
             # target is gone and exit on its own.
             time.sleep(0.5)

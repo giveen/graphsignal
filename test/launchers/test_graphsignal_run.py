@@ -166,18 +166,20 @@ class ExtractFlagsTest(unittest.TestCase):
             (None, None, None, None, ['vllm', 'serve', '--listen-port', '18400']))
 
     def test_invalid_metrics_port_exits(self):
-        with self.assertRaises(SystemExit):
-            graphsignal_run._extract_graphsignal_flags(
-                ['--metrics-port', 'abc', 'vllm', 'serve'])
+        for value in ('abc', '0', '-1', '65536'):
+            with self.subTest(value=value), self.assertRaises(SystemExit):
+                graphsignal_run._extract_graphsignal_flags(
+                    ['--metrics-port', value, 'vllm', 'serve'])
 
     def test_metrics_port_missing_value_exits(self):
         with self.assertRaises(SystemExit):
             graphsignal_run._extract_graphsignal_flags(['--metrics-port'])
 
     def test_invalid_listen_port_exits(self):
-        with self.assertRaises(SystemExit):
-            graphsignal_run._extract_graphsignal_flags(
-                ['--listen-port', 'abc', 'vllm', 'serve'])
+        for value in ('abc', '0', '-1', '65536'):
+            with self.subTest(value=value), self.assertRaises(SystemExit):
+                graphsignal_run._extract_graphsignal_flags(
+                    ['--listen-port', value, 'vllm', 'serve'])
 
     def test_listen_port_missing_value_exits(self):
         with self.assertRaises(SystemExit):

@@ -1,5 +1,8 @@
+import time
 import unittest
+from unittest.mock import patch
 
+from graphsignal.signals import resources as resources_module
 from graphsignal.signals.resources import ResourceStore
 
 
@@ -66,6 +69,34 @@ class ResourceStoreTest(unittest.TestCase):
         exported = self.store.export()[0]
         self.assertEqual(exported['tags'], {'k' * 50: 'v' * 250})
         self.assertEqual(exported['attributes'], {'a' * 50: 'b' * 2500})
+
+    def test_new_resources_are_capped(self):
+        with patch.object(resources_module, 'MAX_RESOURCES', 2):
+            self.store.update_resource('process', tags={'pid': '1'})
+            self.store.update_resource('process', tags={'pid': '2'})
+            self.store.update_resource('process', tags={'pid': '3'})
+
+        self.assertEqual(
+            [r['tags']['pid'] for r in self.store.export()], ['1', '2'])
+
+    def test_existing_resource_refreshes_beyond_cap(self):
+        with patch.object(resources_module, 'MAX_RESOURCES', 1):
+            self.store.update_resource('process', tags={'pid': '1'}, last_seen_ts=10)
+            self.store.update_resource('process', tags={'pid': '1'}, last_seen_ts=20)
+
+        self.assertEqual(self.store.export()[0]['last_seen_ts'], 20)
+
+    def test_stale_resources_expire(self):
+        now = time.time_ns()
+        with patch.object(resources_module, 'CLEANUP_INTERVAL_NS', 0), \
+             patch.object(resources_module, 'RESOURCE_EXPIRY_NS', 100):
+            self.store.update_resource(
+                'process', tags={'pid': 'old'}, last_seen_ts=now - 1000)
+            self.store.update_resource(
+                'process', tags={'pid': 'new'}, last_seen_ts=now)
+
+        self.assertEqual(
+            [r['tags']['pid'] for r in self.store.export()], ['new'])
 
     def test_export_non_destructive(self):
         self.store.update_resource('process', tags={'process.pid': '1'},

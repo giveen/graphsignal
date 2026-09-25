@@ -2,9 +2,10 @@ import glob
 import json
 import os
 import shutil
+import subprocess
 import tempfile
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 from graphsignal.launchers import supervisor
 from graphsignal.launchers.supervisor import _SegmentWriter, launch_supervised
@@ -91,6 +92,31 @@ class SupervisorLaunchTest(unittest.TestCase):
             launch_supervised(['/bin/sh', '-c', 'echo ok; exit 0'])
         records = self._log_records()
         self.assertFalse([r for r in records if 'exit_code' in r or 'signal' in r])
+
+    def test_watcher_exits_naturally_after_target(self):
+        watcher = MagicMock()
+        watcher.wait.return_value = 0
+
+        supervisor._stop_watcher(watcher)
+
+        watcher.wait.assert_called_once_with(timeout=supervisor._WATCHER_EXIT_TIMEOUT)
+        watcher.terminate.assert_not_called()
+        watcher.kill.assert_not_called()
+
+    def test_watcher_forced_cleanup_after_terminate_times_out(self):
+        watcher = MagicMock()
+        timeout = subprocess.TimeoutExpired(cmd='watcher', timeout=1)
+        watcher.wait.side_effect = [timeout, timeout, 0]
+
+        supervisor._stop_watcher(watcher)
+
+        self.assertEqual(watcher.wait.call_args_list, [
+            call(timeout=supervisor._WATCHER_EXIT_TIMEOUT),
+            call(timeout=supervisor._WATCHER_TERMINATE_TIMEOUT),
+            call(),
+        ])
+        watcher.terminate.assert_called_once_with()
+        watcher.kill.assert_called_once_with()
 
     def test_watcher_targets_child_pid_with_passthrough_kwargs(self):
         with self.assertRaises(SystemExit):

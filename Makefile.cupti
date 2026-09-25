@@ -48,7 +48,7 @@ CUPTI_LIB_DIR ?= $(shell \
 # ---------------- Toolchain ----------------
 CXX ?= g++
 NVCC ?= nvcc
-CXXFLAGS ?= -O2 -fPIC -std=c++17
+CXXFLAGS ?= -O2 -fPIC -std=c++17 -Wall -Wextra
 CPPFLAGS ?= -I$(CUPTI_INCLUDE_DIR) -I$(CUDA_INCLUDE_DIR) -Iinclude -Isrc/common$(if $(CUDA_MAJOR), -DCUDA_MAJOR=$(CUDA_MAJOR),)
 NVCCFLAGS ?= -O2 -std=c++17 -arch=native -I$(CUPTI_INCLUDE_DIR) -I$(CUDA_HOME)/include -Iinclude -Isrc/common --compiler-options -fPIC
 

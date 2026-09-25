@@ -1,6 +1,7 @@
 import os
 import unittest
 import urllib.request
+from unittest.mock import patch
 
 import graphsignal.watcher
 from graphsignal.watcher.watcher import Watcher
@@ -82,6 +83,15 @@ class WatcherConfigureTest(unittest.TestCase):
         self.assertIs(graphsignal.watcher.watcher(), first)
         self.assertEqual(graphsignal.watcher.watcher().get_tag('t1'), '1')
 
+    def test_failed_setup_does_not_publish_partial_watcher(self):
+        with patch.object(Watcher, 'setup', side_effect=RuntimeError('boom')), \
+             patch.object(Watcher, 'shutdown') as shutdown:
+            with self.assertRaisesRegex(RuntimeError, 'boom'):
+                graphsignal.watcher.configure(listen_port=free_port())
+
+        self.assertFalse(graphsignal.watcher.is_configured())
+        shutdown.assert_called_once_with()
+
     def test_tag_operations(self):
         watcher = self._configure()
         watcher.set_tag('k1', 'v1')
@@ -89,6 +99,17 @@ class WatcherConfigureTest(unittest.TestCase):
         self.assertEqual(watcher.tags().get('k1'), 'v1')
         watcher.remove_tag('k1')
         self.assertIsNone(watcher.get_tag('k1'))
+
+    def test_tag_limit_rejects_new_tag_at_capacity(self):
+        watcher = self._configure()
+        for i in range(Watcher.MAX_TAGS):
+            watcher.set_tag(f'k{i}', str(i))
+
+        with self.assertLogs('graphsignal', level='ERROR'):
+            watcher.set_tag('overflow', 'x')
+
+        self.assertEqual(len(watcher.tags()), Watcher.MAX_TAGS)
+        self.assertNotIn('overflow', watcher.tags())
 
     def test_metric_passthroughs(self):
         watcher = self._configure()

@@ -1,5 +1,6 @@
 import logging
 import math
+import threading
 import time
 from typing import Optional
 
@@ -79,6 +80,10 @@ class PrometheusRecorder(BaseRecorder):
         self._verified: bool = False
         self._next_detect_ts: float = 0.0
         self._detect_delay_sec: float = INITIAL_DETECT_DELAY_SEC
+        self._lock = threading.Lock()
+        self._fetch_in_flight = False
+        self._fetch_thread = None
+        self._pending_result = None
 
     def setup(self):
         # Scraping is lazy; the first on_tick waits the initial delay since the
@@ -91,31 +96,54 @@ class PrometheusRecorder(BaseRecorder):
         if self._endpoint is None:
             return
 
+        result = self._pending_result
+        self._pending_result = None
+        if result is not None:
+            body, error = result
+            if error is not None:
+                self._record_fetch_failure(error)
+                return
+            if not self._verified:
+                if not _looks_like_prometheus(body):
+                    self._record_fetch_failure(
+                        RuntimeError('response does not look like Prometheus metrics'))
+                    return
+                self._verified = True
+                logger.debug('Prometheus /metrics endpoint confirmed: %s', self._endpoint)
+            try:
+                self._parse_and_emit(body)
+            except Exception as exc:
+                logger.error('Failed to parse Prometheus metrics: %s', exc, exc_info=True)
+            return
+
+        if self._fetch_in_flight:
+            return
         if not self._verified and time.time() < self._next_detect_ts:
             return
+        self._fetch_in_flight = True
+        self._fetch_thread = threading.Thread(
+            target=self._fetch_in_background,
+            args=(self._endpoint,),
+            daemon=True,
+            name='graphsignal-prometheus')
+        self._fetch_thread.start()
 
+    def _fetch_in_background(self, endpoint):
         try:
-            body = self._fetch_metrics(self._endpoint)
+            result = (self._fetch_metrics(endpoint), None)
         except Exception as exc:
-            logger.debug('Failed to fetch %s: %s', self._endpoint, exc)
-            # Server may still be starting up; back off and retry the same port.
-            self._verified = False
-            self._detect_delay_sec = min(self._detect_delay_sec * 2, MAX_DETECT_DELAY_SEC)
-            self._next_detect_ts = time.time() + self._detect_delay_sec
-            return
+            result = (None, exc)
+        with self._lock:
+            if self._fetch_in_flight:
+                self._pending_result = result
+            self._fetch_in_flight = False
 
-        if not self._verified:
-            if not _looks_like_prometheus(body):
-                self._detect_delay_sec = min(self._detect_delay_sec * 2, MAX_DETECT_DELAY_SEC)
-                self._next_detect_ts = time.time() + self._detect_delay_sec
-                return
-            self._verified = True
-            logger.debug('Prometheus /metrics endpoint confirmed: %s', self._endpoint)
-
-        try:
-            self._parse_and_emit(body)
-        except Exception as exc:
-            logger.error('Failed to parse Prometheus metrics: %s', exc, exc_info=True)
+    def _record_fetch_failure(self, error):
+        logger.debug('Failed to fetch %s: %s', self._endpoint, error)
+        # Server may still be starting up; back off and retry the same port.
+        self._verified = False
+        self._detect_delay_sec = min(self._detect_delay_sec * 2, MAX_DETECT_DELAY_SEC)
+        self._next_detect_ts = time.time() + self._detect_delay_sec
 
     @staticmethod
     def _fetch_metrics(url: str, timeout: float = 2.0) -> str:

@@ -271,14 +271,14 @@ class MetricsWriter {
     if (!debug_enabled()) return;
     va_list args;
     va_start(args, fmt);
-    log_v(fmt, args);
+    log_v("debug", fmt, args);
     va_end(args);
   }
 
   void error(const char* fmt, ...) {
     va_list args;
     va_start(args, fmt);
-    log_v(fmt, args);
+    log_v("error", fmt, args);
     va_end(args);
   }
 
@@ -371,7 +371,7 @@ class MetricsWriter {
     }
   }
 
-  void log_v(const char* fmt, va_list args) {
+  void log_v(const char* level, const char* fmt, va_list args) {
     char buf[kMaxLogLineBytes];
     va_list args_copy;
     va_copy(args_copy, args);
@@ -384,6 +384,7 @@ class MetricsWriter {
       std::lock_guard<std::mutex> g(log_mu_);
       LogEntry entry;
       entry.ts = now_ns();
+      entry.level = level;
       entry.msg = buf;
       if (log_ring_.size() >= kMaxLogEntries) {
         log_ring_[log_head_ % kMaxLogEntries] = std::move(entry);
@@ -786,7 +787,9 @@ class MetricsWriter {
       if (i) j += ',';
       j += "{\"ts\":";
       append_u64(j, entry.ts);
-      j += ",\"msg\":\"";
+      j += ",\"level\":\"";
+      json_escape_append(j, entry.level);
+      j += "\",\"msg\":\"";
       json_escape_append(j, entry.msg);
       j += "\"}";
     }
@@ -824,6 +827,7 @@ class MetricsWriter {
 
   struct LogEntry {
     uint64_t ts = 0;
+    std::string level;
     std::string msg;
   };
 

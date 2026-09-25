@@ -54,7 +54,7 @@ def configure(
     if target_pid is None:
         target_pid = os.getpid()
 
-    _watcher = Watcher(
+    new_watcher = Watcher(
         api_key=api_key,
         api_base=api_base,
         tags=tags,
@@ -65,7 +65,19 @@ def configure(
         metrics_host=metrics_host,
         listen_host=listen_host,
         listen_port=listen_port)
-    _watcher.setup()
+    # The PID monitor can discover the target synchronously during setup, and
+    # recorder setup then calls watcher(). Publish the instance for that
+    # callback, but roll it back if setup fails so no partial singleton leaks.
+    _watcher = new_watcher
+    try:
+        new_watcher.setup()
+    except Exception:
+        _watcher = None
+        try:
+            new_watcher.shutdown()
+        except Exception:
+            logger.debug('Error cleaning up failed watcher setup', exc_info=True)
+        raise
 
     atexit.register(shutdown)
 

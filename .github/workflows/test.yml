@@ -15,9 +15,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # The floor and the ceiling. pyproject allows >=3.9, but the suite uses
-        # unittest.assertNoLogs, which arrives in 3.10 — see the note in the
-        # README of this workflow's companion job below.
+        # The declared floor and a representative current release.
         python-version: ['3.10', '3.13']
     steps:
       - uses: actions/checkout@v4
@@ -42,7 +40,15 @@ jobs:
   # These two suites need a compiler and no GPU, so they belong on every commit
   # rather than only on the GPU box.
   native:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            arch: amd64
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
 

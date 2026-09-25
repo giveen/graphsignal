@@ -584,7 +584,8 @@ static void test_log_ring() {
     w->write_now(false);
     std::string j = read_file(w->file_path());
     assert_well_formed(j);
-    ASSERT(contains(j, "\"msg\":\"boom 1\""), "error must always be captured");
+    ASSERT(contains(j, "\"level\":\"error\",\"msg\":\"boom 1\""),
+           "error level must be serialized and the entry always captured");
     ASSERT(!contains(j, "hidden-dbg"),
            "debug must be absent when debug is disabled");
 
@@ -592,8 +593,8 @@ static void test_log_ring() {
     w->debug("shown-dbg");
     w->write_now(false);
     j = read_file(w->file_path());
-    ASSERT(contains(j, "\"msg\":\"shown-dbg\""),
-           "debug must be captured after set_debug(true)");
+    ASSERT(contains(j, "\"level\":\"debug\",\"msg\":\"shown-dbg\""),
+           "debug level must be serialized after set_debug(true)");
     w->shutdown();
   }
 
