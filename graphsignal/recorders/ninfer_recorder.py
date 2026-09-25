@@ -505,8 +505,10 @@ SERVER_START_ATTRIBUTES = (
     ('load_seconds', ('artifact', 'load_seconds')),
 )
 
-# Startup memory as gauges: static for the server's lifetime, and the numbers a
-# reader wants next to the throughput gauges.
+# Startup capacities as gauges: static for the server's lifetime, and the
+# numbers a reader wants next to the throughput gauges. Each name states its
+# unit — the payload spells byte fields with a `_bytes` suffix and leaves
+# token and slot counts bare, and a gauge must not blur the two.
 SERVER_START_GAUGES: List[Tuple[str, Tuple[str, ...]]] = [
     ('ninfer_model_load_seconds', ('artifact', 'load_seconds')),
     ('ninfer_model_upload_seconds', ('artifact', 'upload_seconds')),
@@ -519,7 +521,10 @@ SERVER_START_GAUGES: List[Tuple[str, Tuple[str, ...]]] = [
     ('ninfer_memory_workspace_capacity_bytes',
      ('memory', 'workspace', 'capacity_bytes')),
     ('ninfer_memory_kv_payload_bytes', ('memory', 'kv_payload_bytes')),
-    ('ninfer_memory_kv_capacity_bytes', ('engine', 'kv_capacity')),
+    # `engine.kv_capacity` is a token count, not bytes — the byte-denominated
+    # device KV size is `memory.kv_payload_bytes` above. Name the unit so the
+    # gauge cannot be read as a byte figure.
+    ('ninfer_engine_kv_capacity_tokens', ('engine', 'kv_capacity')),
     ('ninfer_memory_kv_capacity_headroom_bytes',
      ('memory', 'kv_capacity_headroom_bytes')),
     ('ninfer_memory_host_kv_capacity_bytes', ('memory', 'host_kv_capacity_bytes')),

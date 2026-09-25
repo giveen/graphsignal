@@ -97,7 +97,7 @@ def _server_start(ts_ms=_TS_MS, instance=_INSTANCE, **overrides):
         'host_object_count': 0, 'load_seconds': 41.5, 'upload_seconds': 0.0,
     }, engine={
         'device': 0, 'max_context': 131072, 'kv_capacity_mode': 'auto',
-        'kv_capacity': 4294967296, 'kv_capacity_page_groups': 2048,
+        'kv_capacity': 16384, 'kv_capacity_page_groups': 2048,
         'kv_capacity_max_page_groups': 4096, 'expert_cache_slots': 0,
         'expert_cache_bytes': 0, 'ngram_residency': 'mtp3',
         'max_concurrency': 64, 'max_pending_requests': 256,
@@ -842,8 +842,12 @@ class NInferRecorderServerStartTest(NInferRecorderTestBase):
         self.assertEqual(weights.datapoint['value'], 27487790694.0)
         self.assertEqual(weights.datapoint['ts'], _TS_NS)
         self.assertEqual(
-            find_metric(exported, 'ninfer_memory_kv_capacity_bytes',
-                        metric_type='gauge').datapoint['value'], 4294967296.0)
+            find_metric(exported, 'ninfer_engine_kv_capacity_tokens',
+                        metric_type='gauge').datapoint['value'], 16384.0)
+        # The byte-denominated name is gone: `engine.kv_capacity` is a token
+        # count, and a reader must not find it under a `_bytes` gauge.
+        self.assertIsNone(find_metric(exported, 'ninfer_memory_kv_capacity_bytes',
+                                      metric_type='gauge'))
         self.assertEqual(
             find_metric(exported, 'ninfer_model_load_seconds',
                         metric_type='gauge').datapoint['value'], 41.5)

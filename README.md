@@ -57,6 +57,7 @@ Works with any command:
 ```bash
 graphsignal-run sglang serve --model-path <model> --port 8000
 graphsignal-run trtllm-serve <model> --port 8000
+graphsignal-run llama-server <model> --port 8080
 graphsignal-run ninfer-serve <model> <NInfer options>
 graphsignal-run ninfer <model> --prompt "Explain speculative decoding."
 graphsignal-run python my_app.py
@@ -72,7 +73,7 @@ Options (before the command):
 | `--listen-port PORT` | Port for the `/signals` endpoint (default: `18259`). |
 | `--cuda-graph-trace {graph\|node}` | Granularity for CUDA graph launches (default: `graph`). `graph` times each replay as a whole into `cuda_graphs_nanoseconds`; `node` times the kernels inside the graph individually into `cuda_kernels_nanoseconds`. Also settable via `GRAPHSIGNAL_CUDA_GRAPH_TRACE`; the flag wins. |
 
-Engine notes: the SGLang launcher adds `--enable-metrics` so the Prometheus endpoint is available; the vLLM launcher removes `--disable-log-stats` for the same reason. The NInfer launcher automatically enables NInfer's structured `--request-log-jsonl`, which supplies its `ninfer_*` request and engine metrics. NInfer does not expose a Prometheus metrics endpoint, so no metrics scrape is configured for it. Everything else on the command line is passed through unchanged.
+Engine notes: the SGLang launcher adds `--enable-metrics` so the Prometheus endpoint is available; the vLLM launcher removes `--disable-log-stats` for the same reason. The llama.cpp launcher adds `--metrics` so `llama-server` exposes its `/metrics` endpoint, then Graphsignal imports the `llamacpp:*` token, throughput, slot, cache, and speculative-decoding metrics. The NInfer launcher automatically enables NInfer's structured `--request-log-jsonl`, which supplies its `ninfer_*` request and engine metrics. NInfer does not expose a Prometheus metrics endpoint, so no metrics scrape is configured for it. Everything else on the command line is passed through unchanged.
 
 
 ## Optimization loop
@@ -167,6 +168,8 @@ __global__ void my_kernel(..., graphsignal_instrument_data* tile_ns) {
 ```
 
 The record path is lock-free — a few relaxed 64-bit atomics — and probes are inert when nothing reads them. When the process runs under `graphsignal-run`, probe values appear in `/signals` automatically, alongside the built-in metrics.
+
+The profiler finds probes via `dlsym(RTLD_DEFAULT, "__graphsignal_probe_registry_v1")`. A shared library exports that automatically; an executable does not, so probes compiled into the app binary itself are not picked up unless you link it with `-Wl,--export-dynamic-symbol=__graphsignal_probe_registry_v1` (or the broader `-Wl,--export-dynamic`).
 
 See the [GPU Probes guide](https://graphsignal.com/docs/guides/gpu-probes/) for complete instrumentation instructions.
 

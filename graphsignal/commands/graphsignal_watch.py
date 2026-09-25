@@ -1,5 +1,6 @@
 import argparse
 import logging
+import os
 import signal as signal_module
 import sys
 
@@ -15,7 +16,34 @@ Usage:
                     [--metrics-port PORT] [--metrics-path PATH]
                     [--metrics-host HOST]
                     [--listen-host HOST] [--listen-port PORT]
+                    [--status-fd FD]
+
+Options:
+  --listen-host HOST  Host to bind the /signals HTTP endpoint to
+                      (default: 127.0.0.1; any other value exposes the
+                      endpoint to that network)
+  --listen-port PORT  Port for the local /signals HTTP endpoint
+                      (default: 18259)
+  --status-fd FD      Write one status line per /signals endpoint bind state
+                      change to this already-open file descriptor. This
+                      process runs with stderr discarded, so the endpoint's
+                      bind failures are otherwise unobservable from outside;
+                      the parent reads them and reports them.
 """
+
+
+def _status_writer(fd):
+    """Return an `on_signals_bind_event` callback that appends a line to fd,
+    or None when no fd was given. Line-buffered, newline-terminated so a
+    reader can split on newlines, and best effort: the parent may be gone."""
+    if fd is None:
+        return None
+    stream = os.fdopen(int(fd), 'w', buffering=1)
+
+    def _on_bind_event(event, detail):
+        stream.write(f'signals-endpoint {event} {detail}\n')
+
+    return _on_bind_event
 
 
 def _port(value):
@@ -51,6 +79,9 @@ def main():
     parser.add_argument('--listen-port', type=_port, default=None,
                         help='Port for the local /signals HTTP endpoint '
                              '(default: 18259)')
+    parser.add_argument('--status-fd', type=int, default=None,
+                        help='File descriptor to write /signals endpoint bind '
+                             'status lines to (inherited from the parent)')
     args = parser.parse_args()
 
     try:
@@ -61,6 +92,7 @@ def main():
             metrics_host=args.metrics_host,
             listen_host=args.listen_host,
             listen_port=args.listen_port,
+            on_signals_bind_event=_status_writer(args.status_fd),
         )
     except Exception as exc:
         log.error('graphsignal-watch: profiler failed to configure: %s', exc, exc_info=True)

@@ -56,7 +56,8 @@ class Watcher:
             metrics_path=None,
             metrics_host=None,
             listen_host=None,
-            listen_port=None):
+            listen_port=None,
+            on_signals_bind_event=None):
         if debug_mode:
             logger.setLevel(logging.DEBUG)
         else:
@@ -77,6 +78,7 @@ class Watcher:
         self._metrics_host = metrics_host
         self._listen_host = str(listen_host) if listen_host is not None else DEFAULT_LISTEN_HOST
         self._listen_port = int(listen_port) if listen_port is not None else DEFAULT_LISTEN_PORT
+        self._on_signals_bind_event = on_signals_bind_event
 
         self._tick_timer_thread = None
         self._tick_stop_event = threading.Event()
@@ -125,7 +127,8 @@ class Watcher:
             logger.debug('Collector enabled (api key provided)')
 
         self._signals_endpoint = SignalsEndpoint(
-            host=self._listen_host, port=self._listen_port)
+            host=self._listen_host, port=self._listen_port,
+            on_bind_event=self._on_signals_bind_event)
         self._signals_endpoint.setup()
 
         self._pid_monitor = PidMonitor(self._target_pid)

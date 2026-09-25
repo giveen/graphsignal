@@ -30,7 +30,7 @@ DEFAULT_METRICS_HOST = '127.0.0.1'
 
 # Prometheus labels used only for exposition (buckets, multiprocess); not useful
 # as Graphsignal metric tags and they explode cardinality if kept.
-_STRIP_LABELS = frozenset({'le', 'quantile', 'gt', 'pid'})
+_STRIP_LABELS = frozenset({'le', 'quantile', 'gt', 'pid', 'position'})
 
 
 def _is_finite_number(value) -> bool:
@@ -178,7 +178,20 @@ class PrometheusRecorder(BaseRecorder):
                     bucket_groups.setdefault(group_key, []).append(
                         (sample.labels['le'], sample.value))
                     continue
-                sample_groups.setdefault(group_key, {})[sample.name] = sample
+                grouped = sample_groups.setdefault(group_key, {})
+                previous = grouped.get(sample.name)
+                if (previous is not None and mtype == 'counter'
+                        and _is_finite_number(previous.value)
+                        and _is_finite_number(sample.value)):
+                    # Several samples can collapse to one Graphsignal metric when
+                    # exposition-only labels are stripped (for example llama.cpp's
+                    # speculative-decoding position series). Counters are
+                    # cumulative, so the untagged metric must be their sum.
+                    grouped[sample.name] = type(sample)(
+                        sample.name, sample.labels, previous.value + sample.value,
+                        sample.timestamp, sample.exemplar, sample.native_histogram)
+                else:
+                    grouped[sample.name] = sample
 
             for group_key, sample_map in sample_groups.items():
                 tags = dict(group_key)

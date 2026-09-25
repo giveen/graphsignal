@@ -1,4 +1,6 @@
 import json
+import socket
+import time
 import unittest
 import urllib.error
 import urllib.request
@@ -7,7 +9,7 @@ import graphsignal.watcher
 from graphsignal import version
 from graphsignal.signals.routes import (
     SignalsEndpoint, build_payload, quantiles_from_bins)
-from test.test_utils import configure_test_watcher, free_port
+from test.test_utils import configure_test_watcher, free_port, wait_for as _wait_for
 
 
 class QuantilesFromBinsTest(unittest.TestCase):
@@ -26,6 +28,29 @@ class QuantilesFromBinsTest(unittest.TestCase):
         self.assertIsNone(quantiles_from_bins([1], None))
         # All-zero counts: no samples to rank.
         self.assertIsNone(quantiles_from_bins([1], [0]))
+
+    def test_clamped_to_measured_bounds(self):
+        # Bin values overshoot the samples that produced them: a p50 of 30
+        # for observations that top out at 25.
+        self.assertEqual(
+            quantiles_from_bins([0, 10, 20, 30], [1, 4, 3, 2],
+                                lower=1, upper=25),
+            {'p50': 10, 'p95': 25})
+        # A quantile below the measured min is raised to it.
+        self.assertEqual(
+            quantiles_from_bins([0, 10], [10, 0], lower=3, upper=9),
+            {'p50': 3, 'p95': 3})
+        # Without bounds the bin grid is used unclamped.
+        self.assertEqual(quantiles_from_bins([0, 10, 20, 30], [1, 4, 3, 2]),
+                         {'p50': 10, 'p95': 30})
+
+    def test_one_sided_bounds(self):
+        self.assertEqual(
+            quantiles_from_bins([0, 10, 20, 30], [1, 4, 3, 2], upper=25),
+            {'p50': 10, 'p95': 25})
+        self.assertEqual(
+            quantiles_from_bins([0, 10, 20, 30], [1, 4, 3, 2], lower=5),
+            {'p50': 10, 'p95': 30})
 
 
 class BuildPayloadTest(unittest.TestCase):
@@ -135,6 +160,21 @@ class BuildPayloadTest(unittest.TestCase):
         self.assertEqual(stats['mean'], 25.25)
         self.assertEqual(stats['p50'], 20)
         self.assertEqual(stats['p95'], 50)
+
+    def test_histogram_stats_quantiles_clamped_to_min_max(self):
+        # The reported case: bin values above every sample, so a p50 came out
+        # above the maximum. Bins say [2, 10, 20, 30]; the exact aggregates say
+        # the samples were 2, 9 and 25, so nothing exceeds 25.
+        self.watcher.set_histogram('h3', bins=[2, 10, 20, 30], counts=[1, 1, 0, 1],
+                                   measurement_ts=3000, count=3, sum_val=36.0,
+                                   min_val=2, max_val=25)
+        stats = self._get_metric(build_payload(), 'h3')['stats']
+        self.assertEqual(stats['min'], 2)
+        self.assertEqual(stats['max'], 25)
+        self.assertEqual(stats['p50'], 10)
+        self.assertEqual(stats['p95'], 25)
+        self.assertLessEqual(stats['p50'], stats['max'])
+        self.assertGreaterEqual(stats['p50'], stats['min'])
 
     def test_profile_stats_frames_sorted_by_value_desc(self):
         self.watcher.set_profile('p1', frames={'b': 7, 'a': 100, 'c': 50},
@@ -248,13 +288,73 @@ class SignalsEndpointTest(unittest.TestCase):
         self.assertEqual(record['updated_ns'], 1020)
         self.assertEqual(record['stats'], {'value': 20.0})
 
-    def test_second_endpoint_on_same_port_disabled_without_exception(self):
+    def test_second_endpoint_on_same_port_retries_without_exception(self):
         second = SignalsEndpoint(port=self.port)
         second.setup()  # must not raise
         try:
+            # Still not serving: this test watcher holds the port.
             self.assertFalse(second.is_running())
         finally:
             second.shutdown()
+
+    def test_second_endpoint_binds_once_the_port_frees(self):
+        second = SignalsEndpoint(port=self.port)
+        second.setup()
+        try:
+            self.assertFalse(second.is_running())
+            # The first watcher exits, freeing the port. The retry loop must
+            # pick it up rather than staying dead for the instance's life.
+            self.watcher.shutdown()
+            self.assertTrue(_wait_for(lambda: second.is_running()))
+            status, body = self._get('/health')
+            self.assertEqual((status, body), (200, {'status': 'ok'}))
+        finally:
+            second.shutdown()
+
+    def test_bind_events_report_failure_then_success(self):
+        events = []
+        second = SignalsEndpoint(
+            port=self.port, on_bind_event=lambda e, d: events.append((e, d)))
+        second.setup()
+        try:
+            self.assertEqual([e for e, _ in events], ['bind_failed'])
+            self.watcher.shutdown()
+            self.assertTrue(_wait_for(lambda: second.is_running()))
+            self.assertEqual([e for e, _ in events], ['bind_failed', 'bound'])
+            self.assertIn(str(self.port), events[0][1])
+        finally:
+            second.shutdown()
+
+    def test_bind_listener_failure_does_not_break_the_endpoint(self):
+        def boom(event, detail):
+            raise RuntimeError('listener exploded')
+
+        second = SignalsEndpoint(port=self.port, on_bind_event=boom)
+        second.setup()
+        try:
+            self.watcher.shutdown()
+            self.assertTrue(_wait_for(lambda: second.is_running()))
+        finally:
+            second.shutdown()
+
+    def test_shutdown_ends_the_retry_loop(self):
+        # Hold the port so setup() fails and the retry loop starts.
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as held:
+            held.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            held.bind(('127.0.0.1', 0))
+            held.listen(1)
+            port = held.getsockname()[1]
+
+            endpoint = SignalsEndpoint(port=port)
+            endpoint.setup()
+            self.assertFalse(endpoint.is_running())
+            endpoint.shutdown()
+
+            held.close()
+            # Backoff is 0.1s, 0.2s, 0.4s, so a leaked retry thread would have
+            # bound the now-free port several times over by now.
+            time.sleep(0.8)
+            self.assertFalse(endpoint.is_running())
 
 
 if __name__ == '__main__':
