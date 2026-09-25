@@ -53,7 +53,7 @@ CPPFLAGS ?= -I$(CUPTI_INCLUDE_DIR) -I$(CUDA_INCLUDE_DIR) -Iinclude -Isrc/common$
 NVCCFLAGS ?= -O2 -std=c++17 -arch=native -I$(CUPTI_INCLUDE_DIR) -I$(CUDA_HOME)/include -Iinclude -Isrc/common --compiler-options -fPIC
 
 # ---------------- Build outputs ----------------
-SRC := src/cupti/cupti_activity.cpp
+SRC := src/cupti/cupti_activity.cpp src/cupti/nvtx_ranges.cpp
 BUILD_DIR := build
 OUT := $(BUILD_DIR)/libgscuptiprof.so$(if $(CUDA_MAJOR),.$(CUDA_MAJOR),)
 
@@ -68,6 +68,8 @@ TEST_CUPTI_TEST_SRC := src/test/cupti/cupti_activity_test.cpp
 TEST_CUPTI_OUT := $(BUILD_DIR)/cupti_activity_test
 TEST_CUPTI_TEST_OBJ := $(BUILD_DIR)/cupti_activity_test.o
 TEST_CUPTI_OTHER_OBJ := $(BUILD_DIR)/cupti_activity.o
+TEST_NVTX_SRC := src/test/cupti/nvtx_ranges_test.cpp
+TEST_NVTX_OUT := $(BUILD_DIR)/nvtx_ranges_test
 # -rdynamic: the test executable defines the probe registry
 # (__graphsignal_probe_registry_v1) and the lib discovers it via
 # dlsym(RTLD_DEFAULT) — the symbol must be in the dynamic symbol table.
@@ -110,12 +112,12 @@ BUILDX_OUT_DIR ?= dist/cupti
 CUDA12_VERSION ?= 12.4.1
 CUDA13_VERSION ?= 13.0.0
 
-.PHONY: all cupti cupti-install test test-probe test-common test-cupti-activity clean distclean info \
+.PHONY: all cupti cupti-install test test-probe test-common test-cupti-activity test-nvtx clean distclean info \
 	buildx-setup cupti-buildx cupti-buildx-cu12 cupti-buildx-cu13 cupti-buildx-install
 
 all: cupti
 
-test: test-probe test-common test-cupti-activity
+test: test-probe test-common test-cupti-activity test-nvtx
 
 info:
 	@echo "UNAME_S=$(UNAME_S)"
@@ -271,6 +273,14 @@ $(TEST_CUPTI_OUT): $(TEST_CUPTI_TEST_OBJ) $(TEST_CUPTI_OTHER_OBJ) | $(BUILD_DIR)
 $(TEST_CUPTI_TEST_OBJ): $(TEST_CUPTI_TEST_SRC) | $(BUILD_DIR)
 	@echo "Compiling test file with nvcc: $@"
 	$(NVCC) $(NVCCFLAGS) -x cu -c -o "$@" $(TEST_CUPTI_TEST_SRC)
+
+test-nvtx: $(TEST_NVTX_OUT)
+	@echo "Running test: $(TEST_NVTX_OUT)"
+	@./$(TEST_NVTX_OUT)
+
+$(TEST_NVTX_OUT): $(TEST_NVTX_SRC) src/cupti/nvtx_ranges.cpp src/cupti/nvtx_ranges.h | $(BUILD_DIR)
+	@echo "Building test: $@"
+	$(CXX) -std=c++17 -O2 -Wall -Wextra -Iinclude -Isrc/common -pthread -o "$@" $(TEST_NVTX_SRC) src/cupti/nvtx_ranges.cpp -ldl
 
 $(BUILD_DIR)/cupti_activity.o: src/cupti/cupti_activity.cpp | $(BUILD_DIR)
 	@echo "Compiling cupti_activity.cpp with g++: $@"

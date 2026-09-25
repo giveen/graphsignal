@@ -165,6 +165,7 @@ class Watcher:
         from graphsignal.recorders.shm_recorder import ShmRecorder
         from graphsignal.recorders.nvml_recorder import NVMLRecorder
         from graphsignal.recorders.prometheus_recorder import PrometheusRecorder
+        from graphsignal.recorders.ninfer_recorder import NInferRecorder
         from graphsignal.watcher.version_check import start_version_check
 
         # Fires here rather than at setup: this callback runs exactly once, when
@@ -186,6 +187,11 @@ class Watcher:
         recorders.append(ProcessRecorder(
             root_pid=self._target_pid, pid=self._target_pid, args=args))
         recorders.append(ShmRecorder(
+            root_pid=self._target_pid, pid=self._target_pid, args=args))
+        # Root-only and a no-op unless the command is ninfer-serve, so it is
+        # registered unconditionally after the other root recorders: setup
+        # decides whether there is a request log to tail.
+        recorders.append(NInferRecorder(
             root_pid=self._target_pid, pid=self._target_pid, args=args))
 
         active_recorders = []

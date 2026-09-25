@@ -9,6 +9,7 @@ from graphsignal.profilers.rocm_profiler import RocmProfiler
 from graphsignal.launchers.vllm_launcher import VllmLauncher
 from graphsignal.launchers.sglang_launcher import SglangLauncher
 from graphsignal.launchers.trtllm_launcher import TrtllmLauncher
+from graphsignal.launchers.ninfer_launcher import NinferLauncher
 from graphsignal.launchers.fallback_launcher import FallbackLauncher
 
 
@@ -20,13 +21,14 @@ class GraphsignalRunDispatchTest(unittest.TestCase):
         with patch.object(VllmLauncher, 'launch') as v, \
              patch.object(SglangLauncher, 'launch') as s, \
              patch.object(TrtllmLauncher, 'launch') as t, \
+             patch.object(NinferLauncher, 'launch') as n, \
              patch.object(FallbackLauncher, 'launch') as f, \
              patch.object(sys, 'argv', argv):
             try:
                 graphsignal_run.main()
             except SystemExit:
                 pass
-        return v, s, t, f
+        return v, s, t, n, f
 
     def test_no_args_exits(self):
         with patch.object(sys, 'argv', ['graphsignal-run']):
@@ -46,51 +48,69 @@ class GraphsignalRunDispatchTest(unittest.TestCase):
         out.assert_called_once_with(f'graphsignal-run {__version__}')
 
     def test_workload_version_flag_is_forwarded(self):
-        v, s, t, f = self._run_with_argv(['graphsignal-run', 'python', '--version'])
+        v, s, t, n, f = self._run_with_argv(
+            ['graphsignal-run', 'python', '--version'])
         f.assert_called_once()
 
     def test_vllm_wins_over_fallback(self):
-        v, s, t, f = self._run_with_argv(['graphsignal-run', 'vllm', 'serve', 'm'])
+        v, s, t, n, f = self._run_with_argv(
+            ['graphsignal-run', 'vllm', 'serve', 'm'])
         v.assert_called_once()
         s.assert_not_called()
         t.assert_not_called()
+        n.assert_not_called()
         f.assert_not_called()
 
     def test_sglang_executable_wins(self):
-        v, s, t, f = self._run_with_argv(
+        v, s, t, n, f = self._run_with_argv(
             ['graphsignal-run', 'sglang', 'serve', '--model', 'm'])
         s.assert_called_once()
         v.assert_not_called()
         t.assert_not_called()
+        n.assert_not_called()
         f.assert_not_called()
 
     def test_sglang_python_module_form_wins(self):
-        v, s, t, f = self._run_with_argv(
+        v, s, t, n, f = self._run_with_argv(
             ['graphsignal-run', 'python', '-m', 'sglang.launch_server'])
         s.assert_called_once()
         f.assert_not_called()
 
     def test_trtllm_wins(self):
-        v, s, t, f = self._run_with_argv(['graphsignal-run', 'trtllm-serve', '--model', 'm'])
+        v, s, t, n, f = self._run_with_argv(
+            ['graphsignal-run', 'trtllm-serve', '--model', 'm'])
         t.assert_called_once()
         v.assert_not_called()
         s.assert_not_called()
+        n.assert_not_called()
+        f.assert_not_called()
+
+    def test_ninfer_wins_over_fallback(self):
+        v, s, t, n, f = self._run_with_argv(
+            ['graphsignal-run', 'ninfer-perplexity', '--model', 'm'])
+        n.assert_called_once()
+        v.assert_not_called()
+        s.assert_not_called()
+        t.assert_not_called()
         f.assert_not_called()
 
     def test_unrecognised_falls_back(self):
-        v, s, t, f = self._run_with_argv(['graphsignal-run', 'python', 'my_app.py'])
+        v, s, t, n, f = self._run_with_argv(
+            ['graphsignal-run', 'python', 'my_app.py'])
         f.assert_called_once()
         v.assert_not_called()
         s.assert_not_called()
         t.assert_not_called()
+        n.assert_not_called()
 
     def test_leading_flags_stripped_and_command_still_matches(self):
-        v, s, t, f = self._run_with_argv(
+        v, s, t, n, f = self._run_with_argv(
             ['graphsignal-run', '--metrics-port', '8000',
              '--listen-port', '18400', 'vllm', 'serve', 'm'])
         v.assert_called_once()
         s.assert_not_called()
         t.assert_not_called()
+        n.assert_not_called()
         f.assert_not_called()
 
 
