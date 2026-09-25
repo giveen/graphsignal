@@ -75,6 +75,57 @@ class ProcessRecorder(BaseRecorder):
         except psutil.Error:
             pass
 
+        # Host-side triage without stacks or privileges. cpu_percent alone says
+        # "this process is using CPU", not whether it is CPU-saturated, blocked,
+        # or starved of a core — which is the first question when an engine is
+        # host-bound. Split user/system time answers the first, and the two
+        # context-switch counters answer the other two: voluntary switches
+        # climbing means it gave up the CPU (I/O, a lock, a page fault), and
+        # involuntary ones mean the scheduler took it away. All of it comes from
+        # /proc for the process's own user, so it keeps the profiler's
+        # no-privileges contract.
+        try:
+            times = self._psutil_proc.cpu_times()
+            watcher.set_gauge(
+                name='process_user_cpu_seconds',
+                value=times.user,
+                measurement_ts=now_ns,
+                tags={'process.pid': str(self.pid)})
+            watcher.set_gauge(
+                name='process_system_cpu_seconds',
+                value=times.system,
+                measurement_ts=now_ns,
+                tags={'process.pid': str(self.pid)})
+        except psutil.Error:
+            pass
+
+        try:
+            watcher.set_gauge(
+                name='process_threads',
+                value=self._psutil_proc.num_threads(),
+                measurement_ts=now_ns,
+                tags={'process.pid': str(self.pid)})
+        except psutil.Error:
+            pass
+
+        try:
+            switches = self._psutil_proc.num_ctx_switches()
+            watcher.set_counter(
+                name='process_context_switches_voluntary_total',
+                total=switches.voluntary,
+                measurement_ts=now_ns,
+                tags={'process.pid': str(self.pid)})
+            watcher.set_counter(
+                name='process_context_switches_involuntary_total',
+                total=switches.involuntary,
+                measurement_ts=now_ns,
+                tags={'process.pid': str(self.pid)})
+        except (psutil.Error, AttributeError, NotImplementedError):
+            # num_ctx_switches is not implemented on every platform; psutil
+            # signals that as psutil.Error, a plain AttributeError, or
+            # NotImplementedError depending on version and OS.
+            pass
+
         process_attrs = {}
         if self.args:
             process_attrs['process.command_line'] = self.args

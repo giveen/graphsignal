@@ -7,6 +7,7 @@ extern "C" CUptiResult CUPTIAPI cuptiNvtxInitialize(void* pfnGetExportTable);
 #include <generated_nvtx_meta.h>
 #include <nvtx3/nvToolsExt.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
@@ -17,6 +18,10 @@ extern "C" CUptiResult CUPTIAPI cuptiNvtxInitialize(void* pfnGetExportTable);
 #include <string>
 #include <unordered_map>
 #include <vector>
+
+#if defined(__GNUC__) || defined(__clang__)
+#include <cxxabi.h>
+#endif
 
 #include "metrics_writer.h"
 #include "nvtx_ranges.h"
@@ -68,6 +73,11 @@ static graphsignal::Instrument* g_sync_profile = nullptr;
 // Without it an empty cuda_graphs_nanoseconds is ambiguous: node mode, or a
 // workload that launches no graphs at all.
 static graphsignal::Instrument* g_graph_trace_mode_gauge = nullptr;
+// Cumulative CUPTI records the driver could not hand us (buffer overflow under
+// load). Published as a counter so a reader can tell "this engine was idle" from
+// "we lost data and the timings below are incomplete" — a silent gap that used
+// to be visible only in the debug log.
+static graphsignal::Instrument* g_dropped_records_counter = nullptr;
 
 // Graph tracing granularity for this process, set once by
 // cupti_activity_start. Read on the record path only to decide nothing — the
@@ -313,6 +323,99 @@ static void fnv1a64_hex(const std::string& s, char out[17]) {
   std::snprintf(out, 17, "%016llx", static_cast<unsigned long long>(h));
 }
 
+// Reduce one kernel symbol to a readable stem. Itanium-mangled names are
+// demangled (best effort), then everything from the parameter list onward is
+// dropped, and template arguments are dropped too: the structural hash already
+// distinguishes two instantiations that share a stem, so the stem only has to
+// answer "which kernel is this".
+static std::string graph_kernel_stem(const std::string& symbol) {
+  if (symbol.empty()) return std::string("kernel");
+  std::string name = symbol;
+#if defined(__GNUC__) || defined(__clang__)
+  int status = 0;
+  char* demangled = abi::__cxa_demangle(symbol.c_str(), nullptr, nullptr, &status);
+  if (status == 0 && demangled != nullptr) {
+    name = demangled;
+  }
+  std::free(demangled);
+#endif
+  const size_t paren = name.find('(');
+  if (paren != std::string::npos) name.erase(paren);
+  const size_t tmpl = name.find('<');
+  if (tmpl != std::string::npos) name.erase(tmpl);
+  // Trailing "::" left behind by a template-only qualified name.
+  while (name.size() > 2 && name.compare(name.size() - 2, 2, "::") == 0) {
+    name.erase(name.size() - 2);
+  }
+  if (name.empty()) name = "kernel";
+  return name;
+}
+
+// Turn a structural signature into a short human label: the most-used node
+// kinds with their multiplicities, e.g. "flash_attn+gemm*2+memcpy". This is
+// what a reader actually wants from a CUDA-graph frame; the hash alongside it
+// keeps distinct graphs distinct even when their labels collide.
+static std::string graph_label_from_signature(const std::string& sig) {
+  if (sig.empty()) return std::string();
+
+  struct Token {
+    std::string text;
+    uint64_t count;
+  };
+  std::vector<Token> tokens;
+  size_t pos = 0;
+  while (pos < sig.size()) {
+    const size_t end = sig.find(';', pos);
+    const std::string seg =
+        sig.substr(pos, end == std::string::npos ? std::string::npos : end - pos);
+    pos = (end == std::string::npos) ? sig.size() : end + 1;
+    if (seg.empty()) continue;
+
+    const size_t lb = seg.find('[');
+    if (lb == std::string::npos) continue;
+    std::string head = seg.substr(0, lb);
+    const size_t calls = seg.rfind(",calls=");
+    uint64_t n = 1;
+    if (calls != std::string::npos) {
+      n = std::strtoull(seg.c_str() + calls + 7, nullptr, 10);
+      if (n == 0) n = 1;
+    }
+    if (head == "kernel") {
+      const std::string marker = "name=";
+      const size_t nm = seg.find(marker);
+      if (nm != std::string::npos) {
+        const size_t start = nm + marker.size();
+        const size_t stop = (calls == std::string::npos) ? seg.size() : calls;
+        if (stop > start) head = graph_kernel_stem(seg.substr(start, stop - start));
+      }
+    }
+    tokens.push_back(Token{head, n});
+  }
+  if (tokens.empty()) return std::string();
+
+  // Most-used first; ties broken by name so the label is deterministic.
+  std::sort(tokens.begin(), tokens.end(), [](const Token& a, const Token& b) {
+    if (a.count != b.count) return a.count > b.count;
+    return a.text < b.text;
+  });
+
+  constexpr size_t kMaxTokens = 3;
+  std::string label;
+  uint64_t shown = 0;
+  for (size_t i = 0; i < tokens.size() && i < kMaxTokens; ++i) {
+    if (i > 0) label += "+";
+    label += tokens[i].text;
+    if (tokens[i].count > 1) label += "*" + std::to_string(tokens[i].count);
+    shown += tokens[i].count;
+  }
+  if (tokens.size() > kMaxTokens) {
+    // Keep the tail bounded: say how much was left out rather than listing it.
+    label += "+" + std::to_string(tokens.size() - kMaxTokens) + "more";
+  }
+  if (label.size() > 64) label.resize(64);
+  return label;
+}
+
 // ---------------------------------------------------------------------------
 // Lazy instrument registration
 // ---------------------------------------------------------------------------
@@ -350,7 +453,19 @@ static const std::string& graph_frame_name(uint32_t graph_id) {
   if (!sig.empty()) {
     char hex[17];
     fnv1a64_hex(sig, hex);
-    frame = hex;
+    // Readable label plus the hash: the label answers "what is in this graph",
+    // the hash keeps two structurally different graphs from sharing a frame
+    // when their labels happen to agree. The hash alone used to be the whole
+    // frame name, which made the profile unreadable.
+    const std::string label = graph_label_from_signature(sig);
+    if (label.empty()) {
+      frame = hex;
+    } else {
+      char short_hex[9];
+      std::memcpy(short_hex, hex, 8);
+      short_hex[8] = '\0';
+      frame = label + " [" + short_hex + "]";
+    }
   } else {
     frame = "graph_" + std::to_string(graph_id);
   }
@@ -439,6 +554,130 @@ static bool device_probe_reader(const graphsignal_probe_entry* e,
 // CUPTI callbacks
 // ---------------------------------------------------------------------------
 
+// Opt-in CUDA runtime API tracing. Off by default: the profiler's contract is
+// that it costs nothing unless asked. When GRAPHSIGNAL_CUDA_API_TRACE selects
+// it, only the named APIs are traced — CUPTI can enable a small set of runtime
+// APIs individually, without turning on CUPTI_ACTIVITY_KIND_RUNTIME wholesale,
+// so this stays a fraction of what a full API trace costs.
+//
+// The cbid -> name table is built at init by asking CUPTI what each callback id
+// is, rather than by naming the CUPTI_RUNTIME_TRACE_CBID_* enum values: those
+// carry per-API version suffixes that differ between CUDA releases
+// (cudaGraphInstantiate exists as both _v10000 and _v12000), so compile-time
+// references do not survive a toolkit upgrade.
+static constexpr size_t kMaxTracedApis = 48;
+static constexpr size_t kMaxApiNameBytes = 48;
+struct TracedApi {
+  uint32_t cbid;
+  char name[kMaxApiNameBytes];
+};
+static TracedApi g_traced_apis[kMaxTracedApis];
+static size_t g_num_traced_apis = 0;
+static graphsignal::Instrument* g_api_profile = nullptr;
+
+// The APIs worth tracing by default: allocator churn and graph lifecycle, the
+// two costs that show up as unexplained host-side time in an inference engine
+// and are invisible to kernel/memcpy/sync timing.
+static const char* const kDefaultTracedApis[] = {
+    "cudaMalloc", "cudaFree", "cudaMallocAsync", "cudaFreeAsync",
+    "cudaHostAlloc", "cudaHostRegister",
+    "cudaGraphInstantiate", "cudaGraphInstantiateWithFlags", "cudaGraphLaunch",
+    "cudaGraphExecUpdate",
+};
+static constexpr size_t kNumDefaultTracedApis =
+    sizeof(kDefaultTracedApis) / sizeof(kDefaultTracedApis[0]);
+
+// CUPTI reports runtime API names with the ABI version they were introduced in
+// ("cudaMalloc_v3020"), and one API can appear more than once when it was
+// revised ("cudaGraphInstantiate_v10000" and "_v12000"). Strip the suffix so
+// names match the wanted set and read cleanly in the payload; both revisions
+// then share one frame, which is what a reader wants.
+static std::string strip_api_version(const char* name) {
+  std::string s = name ? name : "";
+  const size_t us = s.rfind("_v");
+  if (us == std::string::npos || us + 2 >= s.size()) return s;
+  for (size_t i = us + 2; i < s.size(); ++i) {
+    if (s[i] < '0' || s[i] > '9') return s;  // not a version suffix
+  }
+  return s.substr(0, us);
+}
+
+enum class ApiTraceMode {
+  kOff,
+  kDefaultSet,   // the allocation + graph APIs above
+  kAll,          // every runtime API: enables the kind, so this is the heavy one
+  kList,         // an explicit comma-separated list
+};
+
+static bool env_truthy(const char* v) {
+  if (!v || !*v) return false;
+  return !(v[0] == '0' || v[0] == 'f' || v[0] == 'F' || v[0] == 'n' || v[0] == 'N');
+}
+
+static ApiTraceMode api_trace_mode(const char* selection) {
+  if (!env_truthy(selection)) return ApiTraceMode::kOff;
+  if (!selection || std::strcmp(selection, "all") == 0) return ApiTraceMode::kAll;
+  if (selection[0] == '1' || selection[0] == 't' || selection[0] == 'T' ||
+      selection[0] == 'y' || selection[0] == 'Y' || selection[0] == 'o' ||
+      selection[0] == 'O') {
+    return ApiTraceMode::kDefaultSet;
+  }
+  return ApiTraceMode::kList;
+}
+
+static bool api_name_wanted(const char* name, ApiTraceMode mode, const char* list) {
+  if (!name) return false;
+  if (mode == ApiTraceMode::kList) return std::strstr(list, name) != nullptr;
+  for (size_t i = 0; i < kNumDefaultTracedApis; ++i) {
+    if (std::strcmp(name, kDefaultTracedApis[i]) == 0) return true;
+  }
+  return false;
+}
+
+// Resolve and enable the requested runtime APIs. Returns how many were enabled.
+static size_t enable_traced_runtime_apis(ApiTraceMode mode, const char* list) {
+  g_num_traced_apis = 0;
+  if (mode == ApiTraceMode::kAll) {
+    // Every runtime API. This is the expensive mode: the kind switch traces
+    // every call, which is what nsys does. Off unless explicitly asked for.
+    CUPTI_CALL(cuptiActivityEnable(CUPTI_ACTIVITY_KIND_RUNTIME));
+    return static_cast<size_t>(-1);  // "all": no per-API table
+  }
+  // Runtime cbids are a contiguous generated enum starting at 1. Names are
+  // only available for the DRIVER and RUNTIME domains, and asking past the end
+  // is an error, so walk until a run of misses rather than a hard-coded bound.
+  int consecutive_misses = 0;
+  for (uint32_t cbid = 1; cbid < 8192 && consecutive_misses < 16; ++cbid) {
+    const char* name = nullptr;
+    if (cuptiGetCallbackName(CUPTI_CB_DOMAIN_RUNTIME_API, cbid, &name) != CUPTI_SUCCESS ||
+        name == nullptr) {
+      ++consecutive_misses;
+      continue;
+    }
+    consecutive_misses = 0;
+    const std::string api = strip_api_version(name);
+    if (api.empty() || !api_name_wanted(api.c_str(), mode, list)) continue;
+    if (cuptiActivityEnableRuntimeApi(static_cast<CUpti_CallbackId>(cbid), 1) != CUPTI_SUCCESS) {
+      continue;
+    }
+    if (g_num_traced_apis < kMaxTracedApis) {
+      TracedApi& slot = g_traced_apis[g_num_traced_apis];
+      slot.cbid = cbid;
+      std::strncpy(slot.name, api.c_str(), kMaxApiNameBytes - 1);
+      slot.name[kMaxApiNameBytes - 1] = '\0';
+      ++g_num_traced_apis;
+    }
+  }
+  return g_num_traced_apis;
+}
+
+static const char* traced_api_name(uint32_t cbid) {
+  for (size_t i = 0; i < g_num_traced_apis; ++i) {
+    if (g_traced_apis[i].cbid == cbid) return g_traced_apis[i].name;
+  }
+  return nullptr;
+}
+
 // CUPTI resource callback. Observes CUDA graph instantiation so we can compute
 // each graph's structural signature once, off the launch hot path, and key it
 // by the ids that GRAPH_TRACE may use.
@@ -471,6 +710,28 @@ static void CUPTIAPI graph_resource_callback(void* /*userdata*/, CUpti_CallbackD
       } else if (cbid == CUPTI_CBID_NVTX_nvtxDomainDestroy) {
         const auto* p = reinterpret_cast<const nvtxDomainDestroy_params*>(nd->functionParams);
         if (p) g_nvtx_ranges.on_domain_destroy(reinterpret_cast<uintptr_t>(p->domain));
+      } else if (cbid == CUPTI_CBID_NVTX_nvtxMarkEx) {
+        // A mark is a point event with no duration, so it is counted rather
+        // than timed. Marks were previously ignored entirely.
+        const auto* p = reinterpret_cast<const nvtxMarkEx_params*>(nd->functionParams);
+        const auto* a = p ? p->eventAttrib : nullptr;
+        if (a) {
+          const char* name = (a->messageType == NVTX_MESSAGE_TYPE_REGISTERED)
+                                 ? g_nvtx_ranges.resolve_registered(
+                                       reinterpret_cast<uintptr_t>(a->message.registered))
+                                 : nvtx_message(a);
+          g_nvtx_ranges.on_mark(0, name);
+        }
+      } else if (cbid == CUPTI_CBID_NVTX_nvtxDomainMarkEx) {
+        const auto* p = reinterpret_cast<const nvtxDomainMarkEx_params*>(nd->functionParams);
+        const auto* a = p ? p->core.eventAttrib : nullptr;
+        if (a) {
+          const char* name = (a->messageType == NVTX_MESSAGE_TYPE_REGISTERED)
+                                 ? g_nvtx_ranges.resolve_registered(
+                                       reinterpret_cast<uintptr_t>(a->message.registered))
+                                 : nvtx_message(a);
+          g_nvtx_ranges.on_mark(reinterpret_cast<uintptr_t>(p->domain), name);
+        }
       } else if (cbid == CUPTI_CBID_NVTX_nvtxDomainRangeStartEx ||
                  cbid == CUPTI_CBID_NVTX_nvtxDomainRangePushEx) {
         if (cbid == CUPTI_CBID_NVTX_nvtxDomainRangeStartEx) {
@@ -508,6 +769,43 @@ static void CUPTIAPI graph_resource_callback(void* /*userdata*/, CUpti_CallbackD
         } else {
           const auto* p = reinterpret_cast<const nvtxDomainRangePop_params*>(nd->functionParams);
           if (p) g_nvtx_ranges.on_end(reinterpret_cast<uintptr_t>(p->domain), 0, false);
+        }
+      } else if (cbid == CUPTI_CBID_NVTX_nvtxRangeStartEx ||
+                 cbid == CUPTI_CBID_NVTX_nvtxRangePushEx) {
+        // Default-domain ranges: an engine that annotates without creating a
+        // domain of its own lands here. Domain 0 is adopted only when asked
+        // for, and the aggregator ignores everything else.
+        if (cbid == CUPTI_CBID_NVTX_nvtxRangeStartEx) {
+          const auto* p = reinterpret_cast<const nvtxRangeStartEx_params*>(nd->functionParams);
+          const auto* a = p ? p->eventAttrib : nullptr;
+          if (a) {
+            const char* name = (a->messageType == NVTX_MESSAGE_TYPE_REGISTERED)
+                                   ? g_nvtx_ranges.resolve_registered(
+                                         reinterpret_cast<uintptr_t>(a->message.registered))
+                                   : nvtx_message(a);
+            g_nvtx_ranges.on_start_category(0, a->category, name,
+                                            reinterpret_cast<uintptr_t>(nd->functionReturnValue),
+                                            true);
+          }
+        } else {
+          const auto* p = reinterpret_cast<const nvtxRangePushEx_params*>(nd->functionParams);
+          const auto* a = p ? p->eventAttrib : nullptr;
+          if (a) {
+            const char* name = (a->messageType == NVTX_MESSAGE_TYPE_REGISTERED)
+                                   ? g_nvtx_ranges.resolve_registered(
+                                         reinterpret_cast<uintptr_t>(a->message.registered))
+                                   : nvtx_message(a);
+            g_nvtx_ranges.on_start_category(0, a->category, name, 0, false);
+          }
+        }
+      } else if (cbid == CUPTI_CBID_NVTX_nvtxRangeEnd ||
+                 cbid == CUPTI_CBID_NVTX_nvtxRangePop) {
+        if (cbid == CUPTI_CBID_NVTX_nvtxRangeEnd) {
+          const auto* p = reinterpret_cast<const nvtxRangeEnd_params*>(nd->functionParams);
+          if (p) g_nvtx_ranges.on_end(0, p->id, true);
+        } else {
+          const auto* p = reinterpret_cast<const nvtxRangePop_params*>(nd->functionParams);
+          if (p) g_nvtx_ranges.on_end(0, 0, false);
         }
       }
       return;
@@ -640,6 +938,19 @@ static void CUPTIAPI bufferCompleted(CUcontext ctx, uint32_t streamId, uint8_t* 
                 g_sync_profile, syncTypeToStr(s->type), s->end - s->start);
             break;
           }
+          case CUPTI_ACTIVITY_KIND_RUNTIME: {
+            // Only reached for the APIs opted into by
+            // GRAPHSIGNAL_CUDA_API_TRACE; anything else is filtered by CUPTI
+            // and never arrives here.
+            const auto* a = reinterpret_cast<const CUpti_ActivityAPI*>(record);
+            if (a->start == 0 && a->end == 0) break;
+            if (a->end <= a->start) break;
+            const char* name = traced_api_name(a->cbid);
+            if (name == nullptr) break;
+            graphsignal::MetricsWriter::profile_add(
+                g_api_profile, name, a->end - a->start);
+            break;
+          }
           default:
             break;
         }
@@ -654,13 +965,18 @@ static void CUPTIAPI bufferCompleted(CUcontext ctx, uint32_t streamId, uint8_t* 
     } while (status == CUPTI_SUCCESS);
   }
 
-  // Count any dropped records since the previous call (for the debug log only).
-  // Use the callback-provided (context, streamId) to be compatible across CUDA
-  // 12/13.
+  // Count any dropped records since the previous call. Use the
+  // callback-provided (context, streamId) to be compatible across CUDA 12/13.
+  // These are records the driver never produced, so every timing this run
+  // reports is missing them: publish the total rather than leaving the loss
+  // visible only in the debug log.
   size_t dropped = 0;
   CUPTI_CALL(cuptiActivityGetNumDroppedRecords(ctx, streamId, &dropped));
 
   if (g_writer) {
+    if (dropped > 0) {
+      graphsignal::MetricsWriter::add(g_dropped_records_counter, dropped);
+    }
     g_writer->debug("cupti bufferCompleted: size=%zu validSize=%zu dropped=%zu",
                     size, validSize, dropped);
   }
@@ -715,6 +1031,10 @@ int cupti_activity_start(uint64_t write_interval_ns, uint32_t debug_mode,
         graphsignal::InstrumentType::Profile, "cuda_sync_nanoseconds", {});
     g_graph_trace_mode_gauge = writer->register_instrument(
         graphsignal::InstrumentType::Gauge, "cuda_graph_trace_mode", {});
+    g_dropped_records_counter = writer->register_instrument(
+        graphsignal::InstrumentType::Counter, "cuda_dropped_records_total", {});
+    g_api_profile = writer->register_instrument(
+        graphsignal::InstrumentType::Profile, "cuda_api_nanoseconds", {});
   }
   graphsignal::MetricsWriter::set(g_graph_trace_mode_gauge,
                                   static_cast<double>(g_graph_trace_mode));
@@ -728,10 +1048,15 @@ int cupti_activity_start(uint64_t write_interval_ns, uint32_t debug_mode,
   g_writer->set_device_probe_batch_reader(device_probe_batch_reader, nullptr);
   g_nvtx_ranges.reset();
   const char* adopt_ninfer_domain = std::getenv("GRAPHSIGNAL_NINFER_NVTX");
+  // Which NVTX domains to adopt beyond NInfer's: "all", or a comma-separated
+  // list of domain names ("default" names the implicit default domain).
+  // Unset keeps the previous behaviour — NInfer only.
+  const char* nvtx_domains = std::getenv("GRAPHSIGNAL_NVTX_DOMAINS");
   g_nvtx_ranges.configure(
       writer, adopt_ninfer_domain && (adopt_ninfer_domain[0] == '1' ||
                                      adopt_ninfer_domain[0] == 't' ||
-                                     adopt_ninfer_domain[0] == 'T'));
+                                     adopt_ninfer_domain[0] == 'T'),
+      nvtx_domains);
 
   CUPTI_CALL(cuptiActivityRegisterCallbacks(bufferRequested, bufferCompleted));
 
@@ -739,6 +1064,25 @@ int cupti_activity_start(uint64_t write_interval_ns, uint32_t debug_mode,
   CUPTI_CALL(cuptiActivityEnable(CUPTI_ACTIVITY_KIND_MEMCPY));
   CUPTI_CALL(cuptiActivityEnable(CUPTI_ACTIVITY_KIND_MEMSET));
   CUPTI_CALL(cuptiActivityEnable(CUPTI_ACTIVITY_KIND_SYNCHRONIZATION));
+
+  // Opt-in CUDA runtime API timing. Unset by default so the profiler costs
+  // nothing here; the default selection traces only the allocation and graph
+  // APIs rather than all of them, which is what keeps this affordable.
+  {
+    const char* api_trace = std::getenv("GRAPHSIGNAL_CUDA_API_TRACE");
+    const ApiTraceMode mode = api_trace_mode(api_trace);
+    if (mode != ApiTraceMode::kOff) {
+      const size_t enabled = enable_traced_runtime_apis(mode, api_trace);
+      if (g_writer) {
+        if (mode == ApiTraceMode::kAll) {
+          g_writer->debug("cupti: tracing ALL CUDA runtime APIs (GRAPHSIGNAL_CUDA_API_TRACE=all)");
+        } else {
+          g_writer->debug("cupti: tracing %zu CUDA runtime API(s) (selection: %s)",
+                          enabled, api_trace ? api_trace : "1");
+        }
+      }
+    }
+  }
 
   // Trace CUDA graphs at GRAPH granularity rather than per node. When
   // GRAPH_TRACE is enabled CUPTI stops instrumenting the individual nodes of a

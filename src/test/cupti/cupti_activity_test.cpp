@@ -305,6 +305,7 @@ __global__ void probe_record_kernel(graphsignal_instrument_data* inst,
 // ---------------------------------------------------------------------------
 
 static const char* kGraphTraceMarker = "--graph-trace-scenario";
+static const char* kApiTraceMarker = "--api-trace-scenario";
 
 // Kernel A once and kernel B once, captured into a graph, replayed
 // kGraphTraceReplays times, plus a single eager launch of A afterwards. The
@@ -391,6 +392,18 @@ static int graph_trace_scenario() {
   const auto graph_blocks = find_metric_blocks(json, "cuda_graphs_nanoseconds");
   ASSERT(graph_blocks.size() == 1, "cuda_graphs_nanoseconds profile missing");
 
+  // Data loss must be visible in the payload, not just the debug log: the
+  // counter is always present, so a reader can tell "nothing was lost" (0)
+  // from "this metric is missing".
+  {
+    const auto dropped = find_metric_blocks(json, "cuda_dropped_records_total");
+    ASSERT(dropped.size() == 1, "cuda_dropped_records_total counter missing");
+    ASSERT(dropped[0].find("\"type\":\"counter\"") != std::string::npos,
+           "cuda_dropped_records_total must serialize as a counter");
+    const double lost = block_double(dropped[0], "value");
+    std::printf("cuda_dropped_records_total=%g\n", lost);
+  }
+
   const uint64_t samples_a = frame_samples_containing(kernel_blocks[0], "busy_wait_kernel_A");
   const uint64_t samples_b = frame_samples_containing(kernel_blocks[0], "busy_wait_kernel_B");
   const auto graph_frames = parse_frames(graph_blocks[0]);
@@ -459,9 +472,107 @@ static void run_graph_trace_child(const char* env_value) {
   ASSERT_EQ(WEXITSTATUS(status), 0, "graph-trace child must exit 0");
 }
 
+// ---------------------------------------------------------------------------
+// Opt-in CUDA runtime API tracing (GRAPHSIGNAL_CUDA_API_TRACE)
+// ---------------------------------------------------------------------------
+
+// Allocation and graph lifecycle in a process of its own: CUPTI can only trace
+// runtime APIs that run after it is enabled, and the selection is read at
+// startup, so this has to be a re-exec'd child.
+static int api_trace_scenario() {
+  const uint64_t write_interval_ns = 100'000'000ULL;
+  ASSERT(cupti_activity_start(write_interval_ns, /*debug_mode=*/1,
+                              /*graph_trace_mode=*/0) == 1,
+         "cupti_activity_start must succeed for the api-trace scenario");
+
+  // Allocation churn and graph lifecycle: the two costs an inference engine
+  // pays on the host that kernel/memcpy/sync timing cannot explain.
+  for (int i = 0; i < 3; ++i) {
+    void* p = nullptr;
+    if (cudaMalloc(&p, 1 << 20) == cudaSuccess) cudaFree(p);
+  }
+  cudaStream_t stream = nullptr;
+  ASSERT(cudaStreamCreate(&stream) == cudaSuccess, "api-trace stream create");
+  float* kernel_data = nullptr;
+  ASSERT(cudaMalloc(&kernel_data, sizeof(float) * 32) == cudaSuccess,
+         "api-trace kernel buffer");
+  cudaGraph_t graph = nullptr;
+  cudaGraphExec_t exec = nullptr;
+  ASSERT(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal) == cudaSuccess,
+         "api-trace capture begin");
+  test_kernel<<<1, 32, 0, stream>>>(kernel_data, 32);
+  ASSERT(cudaStreamEndCapture(stream, &graph) == cudaSuccess, "api-trace capture end");
+  ASSERT(cudaGraphInstantiate(&exec, graph, 0) == cudaSuccess, "api-trace instantiate");
+  ASSERT(cudaGraphLaunch(exec, stream) == cudaSuccess, "api-trace launch");
+  ASSERT(cudaStreamSynchronize(stream) == cudaSuccess, "api-trace sync");
+  cudaGraphExecDestroy(exec);
+  cudaGraphDestroy(graph);
+  cudaStreamDestroy(stream);
+  cudaFree(kernel_data);
+
+  std::this_thread::sleep_for(std::chrono::milliseconds(700));
+  cupti_activity_stop();
+
+  const std::string json = read_file(shm_json_path());
+  ASSERT(!json.empty(), "cupti.json must exist in the api-trace child");
+  const auto blocks = find_metric_blocks(json, "cuda_api_nanoseconds");
+  ASSERT_EQ(blocks.size(), static_cast<size_t>(1), "cuda_api_nanoseconds profile missing");
+  ASSERT(blocks[0].find("\"type\":\"profile\"") != std::string::npos,
+         "cuda_api_nanoseconds must serialize as a profile");
+  const auto frames = parse_frames(blocks[0]);
+  ASSERT(!frames.empty(), "no CUDA API frames recorded");
+  for (const auto& f : frames) {
+    std::printf("api frame: %s=%llu ns (%llu calls)\n", f.name.c_str(),
+                static_cast<unsigned long long>(f.value),
+                static_cast<unsigned long long>(f.samples));
+  }
+  // The allocation and graph APIs must appear, with call counts and durations.
+  ASSERT(frame_samples_containing(blocks[0], "cudaMalloc") >= 3,
+         "cudaMalloc calls must be traced");
+  ASSERT(frame_value_containing(blocks[0], "cudaGraphInstantiate") > 0,
+         "cudaGraphInstantiate duration must be traced");
+  ASSERT(frame_samples_containing(blocks[0], "cudaGraphLaunch") >= 1,
+         "cudaGraphLaunch calls must be traced");
+  // The selection is a small set, not a full API trace: the stream-creation
+  // and synchronization APIs are not in it.
+  ASSERT(!has_frame_containing(blocks[0], "cudaStreamCreate"),
+         "APIs outside the selection must not be traced");
+  ASSERT(!has_frame_containing(blocks[0], "cudaDeviceSynchronize"),
+         "APIs outside the selection must not be traced");
+
+  std::printf("api-trace child passed\n");
+  return 0;
+}
+
+static void run_api_trace_child(const char* env_value) {
+  std::printf("--- api-trace child: GRAPHSIGNAL_CUDA_API_TRACE=%s\n",
+              env_value ? env_value : "<unset>");
+  pid_t pid = fork();
+  ASSERT(pid >= 0, "fork must succeed");
+  if (pid == 0) {
+    if (env_value) {
+      setenv("GRAPHSIGNAL_CUDA_API_TRACE", env_value, 1);
+    } else {
+      unsetenv("GRAPHSIGNAL_CUDA_API_TRACE");
+    }
+    char arg0[] = "cupti_activity_test";
+    char arg1[] = "--api-trace-scenario";
+    char* const child_argv[] = {arg0, arg1, nullptr};
+    execv("/proc/self/exe", child_argv);
+    _exit(127);
+  }
+  int status = 0;
+  ASSERT(waitpid(pid, &status, 0) == pid, "waitpid must return the api-trace child");
+  ASSERT(WIFEXITED(status), "api-trace child must exit normally");
+  ASSERT_EQ(WEXITSTATUS(status), 0, "api-trace child must exit 0");
+}
+
 int main(int argc, char** argv) {
   if (argc > 1 && std::strcmp(argv[1], kGraphTraceMarker) == 0) {
     return graph_trace_scenario();
+  }
+  if (argc > 1 && std::strcmp(argv[1], kApiTraceMarker) == 0) {
+    return api_trace_scenario();
   }
 
   int device_count = 0;
@@ -479,6 +590,10 @@ int main(int argc, char** argv) {
   run_graph_trace_child(nullptr);   // default: GRAPH granularity
   run_graph_trace_child("node");    // opt-in: NODE granularity
   run_graph_trace_child("nodes");   // invalid: falls back to GRAPH
+
+  // Opt-in CUDA runtime API tracing. This process leaves the variable unset, so
+  // the suite's own metrics must be unaffected by the feature existing.
+  run_api_trace_child("1");
 
   // HOST-storage probe, registered before profiling starts. The writer reads
   // the registry on every serialize, so it appears in cupti.json.
@@ -625,8 +740,8 @@ int main(int argc, char** argv) {
     ASSERT(dur_b > 0, "cuda_kernels_nanoseconds frame for busy_wait_kernel_B missing");
   }
 
-  // --- cuda_graphs_nanoseconds: one frame — the 16-hex hash of the graph's structural
-  // signature — with the cumulative duration of all launches.
+  // --- cuda_graphs_nanoseconds: one frame naming what the graph contains plus a
+  // short structural hash, with the cumulative duration of all launches.
   {
     const auto blocks = find_metric_blocks(json1, "cuda_graphs_nanoseconds");
     ASSERT(blocks.size() == 1, "cuda_graphs_nanoseconds profile missing");
@@ -636,14 +751,25 @@ int main(int argc, char** argv) {
     ASSERT(frames.size() == 1, "exactly one graph frame expected");
     std::printf("cuda_graphs_nanoseconds frame: %s=%llu ns\n", frames[0].name.c_str(),
                 static_cast<unsigned long long>(frames[0].value));
+    std::fflush(stdout);
     ASSERT(frames[0].value > 0, "graph frame duration must be > 0");
     ASSERT(frames[0].samples > 0, "graph frame must count its replays");
-    ASSERT(frames[0].name.size() == 16,
-           "graph frame must be a 16-hex signature hash");
-    for (char c : frames[0].name) {
-      ASSERT(std::isxdigit(static_cast<unsigned char>(c)) &&
-             !std::isupper(static_cast<unsigned char>(c)),
-             "graph frame must be lowercase hex");
+    // The label carries the kernel/node names and their multiplicities, so a
+    // reader can tell what the graph replays without cross-referencing another
+    // process. This graph is three launches of one kernel.
+    ASSERT(frames[0].name.find("test_kernel*3") != std::string::npos,
+           "graph frame must name the kernels it contains and how often");
+    // ... and the 8-hex structural hash keeps two different graphs apart even
+    // if their labels agree. It sits in "[xxxxxxxx]": 8 digits then the bracket.
+    const size_t lb = frames[0].name.rfind('[');
+    ASSERT(lb != std::string::npos, "graph frame must carry a structural hash");
+    ASSERT(frames[0].name.size() == lb + 10 &&
+               frames[0].name[lb + 9] == ']',
+           "graph frame hash must be 8 hex digits in brackets");
+    for (size_t i = lb + 1; i <= lb + 8; ++i) {
+      ASSERT(std::isxdigit(static_cast<unsigned char>(frames[0].name[i])) &&
+             !std::isupper(static_cast<unsigned char>(frames[0].name[i])),
+             "graph frame hash must be lowercase hex");
     }
   }
 

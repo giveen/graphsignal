@@ -351,6 +351,12 @@ int tool_init(rocprofiler_client_finalize_t /*fini*/, void* /*tool_data*/) {
     // only when the buffer is genuinely full; the generous size + watermark
     // auto-flush + the Writer's ~1s flush hook keep that path cold in practice.
     // This matches the rocprofiler-sdk buffered-tracing samples.
+    //
+    // Note the asymmetry with the CUPTI library, which publishes
+    // cuda_dropped_records_total: CUPTI drops records when its buffer overflows
+    // and reports how many, whereas LOSSLESS here makes the producer wait, so a
+    // full buffer costs a slowdown rather than missing data. No dropped-records
+    // counter is needed on this path.
     ROCP_CALL(rocprofiler_create_buffer(
         g_ctx_id, kBufferSize, kBufferWatermark,
         ROCPROFILER_BUFFER_POLICY_LOSSLESS, buffer_callback, nullptr, &g_buffer_id));
