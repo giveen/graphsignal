@@ -146,7 +146,14 @@ typedef struct graphsignal_probe_registry {
 } graphsignal_probe_registry;
 
 /* One registry per process. Default visibility so the dynamic linker unifies
-   vendored copies across shared objects and readers can dlsym it. */
+   vendored copies across shared objects and readers can dlsym it.
+
+   Default visibility is necessary but not sufficient in an executable: an
+   executable's symbols reach .dynsym only when the link exports them, so a
+   binary that registers its own probes must be linked with
+   `-Wl,--export-dynamic-symbol=__graphsignal_probe_registry_v1` (or
+   `--export-dynamic`). Without it the registry is in .symtab only, readers'
+   dlsym misses it, and no probe values are reported. */
 extern "C" {
 #if defined(_WIN32)
 inline graphsignal_probe_registry __graphsignal_probe_registry_v1;

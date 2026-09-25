@@ -5,7 +5,7 @@ these. Access the active watcher via `graphsignal.watcher.watcher()` (raises if
 not configured).
 """
 
-from typing import Dict, Optional
+from typing import Callable, Dict, Optional
 import atexit
 import logging
 import os
@@ -31,6 +31,7 @@ def configure(
     metrics_host: Optional[str] = None,
     listen_host: Optional[str] = None,
     listen_port: Optional[int] = None,
+    on_signals_bind_event: Optional[Callable[[str, str], None]] = None,
 ) -> None:
     global _watcher
 
@@ -64,7 +65,8 @@ def configure(
         metrics_path=metrics_path,
         metrics_host=metrics_host,
         listen_host=listen_host,
-        listen_port=listen_port)
+        listen_port=listen_port,
+        on_signals_bind_event=on_signals_bind_event)
     # The PID monitor can discover the target synchronously during setup, and
     # recorder setup then calls watcher(). Publish the instance for that
     # callback, but roll it back if setup fails so no partial singleton leaks.

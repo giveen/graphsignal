@@ -7,7 +7,7 @@ import graphsignal.watcher
 from graphsignal.watcher.watcher import Watcher
 from graphsignal.collector.collector import Collector
 from test.test_utils import (
-    clear_graphsignal_env, configure_test_watcher, free_port)
+    clear_graphsignal_env, configure_test_watcher, free_port, wait_for)
 
 
 class WatcherConfigureTest(unittest.TestCase):
@@ -144,18 +144,27 @@ class WatcherConfigureTest(unittest.TestCase):
         resources = watcher.resource_store().export()
         self.assertTrue(any(r['kind'] == 'process' for r in resources))
 
-    def test_listen_port_conflict_disables_endpoint(self):
+    def test_listen_port_conflict_keeps_retrying(self):
         port = free_port()
         first = self._configure(listen_port=port)
         self.assertTrue(first.signals_endpoint().is_running())
 
-        # A second endpoint on the same port logs and disables itself; the
-        # watcher must not crash.
-        second = Watcher(target_pid=os.getpid(), listen_port=port)
+        # A second endpoint on the same port reports the conflict and retries
+        # in the background; the watcher must not crash, and must not stay
+        # dead for good once the first watcher releases the port.
+        events = []
+        second = Watcher(
+            target_pid=os.getpid(), listen_port=port,
+            on_signals_bind_event=lambda e, d: events.append(e))
         second._auto_tick = False
         second.setup()
         try:
             self.assertFalse(second.signals_endpoint().is_running())
+            self.assertIn('bind_failed', events)
+            first.shutdown()
+            self.assertTrue(wait_for(
+                lambda: second.signals_endpoint().is_running()))
+            self.assertIn('bound', events)
         finally:
             second.shutdown()
 

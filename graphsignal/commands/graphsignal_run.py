@@ -5,6 +5,7 @@ import sys
 from graphsignal.launchers.vllm_launcher import VllmLauncher
 from graphsignal.launchers.sglang_launcher import SglangLauncher
 from graphsignal.launchers.trtllm_launcher import TrtllmLauncher
+from graphsignal.launchers.llama_launcher import LlamaLauncher
 from graphsignal.launchers.ninfer_launcher import NinferLauncher
 from graphsignal.launchers.fallback_launcher import FallbackLauncher
 
@@ -53,6 +54,7 @@ Example:
   graphsignal-run vllm serve facebook/opt-125m --port 8001
   graphsignal-run sglang serve --model-path <model>
   graphsignal-run --metrics-port 8000 trtllm-serve <model> --port 8000
+  graphsignal-run llama-server <model> --port 8080
   graphsignal-run python myapp.py
   graphsignal-run app.py
 """
@@ -176,6 +178,7 @@ def main():
         VllmLauncher(target_args, **launcher_kwargs),
         SglangLauncher(target_args, **launcher_kwargs),
         TrtllmLauncher(target_args, **launcher_kwargs),
+        LlamaLauncher(target_args, **launcher_kwargs),
         NinferLauncher(target_args, **launcher_kwargs),
         FallbackLauncher(target_args, **launcher_kwargs),
     ]

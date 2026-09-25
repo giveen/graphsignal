@@ -1,3 +1,4 @@
+import os
 import subprocess
 import sys
 import unittest
@@ -86,6 +87,19 @@ class ResolveMetricsPortTest(unittest.TestCase):
 
 
 class StartWatcherTest(unittest.TestCase):
+    def _user_args(self, cmd):
+        """The argv after the leading `python -m ... --pid PID` prefix, minus
+        the `--status-fd N` pair the parent always appends (its own tests
+        cover that)."""
+        self.assertEqual(cmd[:4], [sys.executable,
+                                   '-m', 'graphsignal.commands.graphsignal_watch',
+                                   '--pid'])
+        rest = cmd[5:]
+        if '--status-fd' in rest:
+            self.assertEqual(rest[-2], '--status-fd')
+            rest = rest[:-2]
+        return rest
+
     def test_spawn_args_default(self):
         fake_popen = MagicMock(name='Popen')
         with patch.object(subprocess, 'Popen', return_value=fake_popen) as popen_m:
@@ -96,16 +110,39 @@ class StartWatcherTest(unittest.TestCase):
         cmd = popen_m.call_args[0][0]
         kwargs = popen_m.call_args[1]
 
-        self.assertEqual(cmd, [sys.executable,
-                               '-m', 'graphsignal.commands.graphsignal_watch',
-                               '--pid', '12345'])
+        self.assertEqual(cmd[:5], [sys.executable,
+                                   '-m', 'graphsignal.commands.graphsignal_watch',
+                                   '--pid', '12345'])
+        self.assertEqual(self._user_args(cmd), [])
         self.assertTrue(kwargs.get('start_new_session'))
+
+    def test_spawns_with_a_status_pipe(self):
+        # The child's stderr is discarded, so the /signals endpoint's bind
+        # failures need a pipe back to this process. The read end is pumped by
+        # a thread, which is stubbed here so no real fd outlives the test.
+        with patch.object(subprocess, 'Popen', return_value=MagicMock()) as popen_m:
+            with patch.object(os, 'pipe', return_value=(21, 22)) as pipe_m:
+                with patch.object(os, 'close') as close_m:
+                    with patch.object(command_utils.threading, 'Thread') as thread_m:
+                        start_watcher(12345)
+
+        pipe_m.assert_called_once()
+        cmd = popen_m.call_args[0][0]
+        kwargs = popen_m.call_args[1]
+        self.assertEqual(cmd[-2:], ['--status-fd', '22'])
+        self.assertEqual(tuple(kwargs['pass_fds']), (22,))
+        # The parent closes its copy of the write end, or the reader thread
+        # would never see EOF when the child exits.
+        self.assertIn(22, [call.args[0] for call in close_m.call_args_list])
+        # ... and pumps the read end on a background thread.
+        thread_m.assert_called_once()
+        self.assertEqual(thread_m.call_args.kwargs['args'], (21,))
 
     def test_spawn_args_with_metrics_port(self):
         with patch.object(subprocess, 'Popen', return_value=MagicMock()) as popen_m:
             start_watcher(54321, metrics_port=8000)
         cmd = popen_m.call_args[0][0]
-        self.assertEqual(cmd[5:], ['--metrics-port', '8000'])
+        self.assertEqual(self._user_args(cmd), ['--metrics-port', '8000'])
 
     def test_spawn_args_with_metrics_path(self):
         with patch.object(subprocess, 'Popen', return_value=MagicMock()) as popen_m:
@@ -113,7 +150,7 @@ class StartWatcherTest(unittest.TestCase):
                           metrics_path='/prometheus/metrics')
         cmd = popen_m.call_args[0][0]
         self.assertEqual(
-            cmd[5:],
+            self._user_args(cmd),
             ['--metrics-port', '8000', '--metrics-path', '/prometheus/metrics'])
 
     def test_spawn_args_with_metrics_host(self):
@@ -121,19 +158,19 @@ class StartWatcherTest(unittest.TestCase):
             start_watcher(54321, metrics_port=8000, metrics_host='localhost')
         cmd = popen_m.call_args[0][0]
         self.assertEqual(
-            cmd[5:], ['--metrics-port', '8000', '--metrics-host', 'localhost'])
+            self._user_args(cmd), ['--metrics-port', '8000', '--metrics-host', 'localhost'])
 
     def test_spawn_args_with_listen_port(self):
         with patch.object(subprocess, 'Popen', return_value=MagicMock()) as popen_m:
             start_watcher(54321, listen_port=18400)
         cmd = popen_m.call_args[0][0]
-        self.assertEqual(cmd[5:], ['--listen-port', '18400'])
+        self.assertEqual(self._user_args(cmd), ['--listen-port', '18400'])
 
     def test_spawn_args_with_listen_host(self):
         with patch.object(subprocess, 'Popen', return_value=MagicMock()) as popen_m:
             start_watcher(54321, listen_host='0.0.0.0')
         cmd = popen_m.call_args[0][0]
-        self.assertEqual(cmd[5:], ['--listen-host', '0.0.0.0'])
+        self.assertEqual(self._user_args(cmd), ['--listen-host', '0.0.0.0'])
 
     def test_spawn_args_with_all_kwargs(self):
         with patch.object(subprocess, 'Popen', return_value=MagicMock()) as popen_m:
@@ -143,15 +180,19 @@ class StartWatcherTest(unittest.TestCase):
                           listen_port=18400)
         cmd = popen_m.call_args[0][0]
         self.assertEqual(
-            cmd[5:],
+            self._user_args(cmd),
             ['--metrics-port', '8000', '--metrics-path', '/prometheus/metrics',
              '--metrics-host', 'localhost', '--listen-host', '0.0.0.0',
              '--listen-port', '18400'])
 
     def test_returns_none_on_failure(self):
         with patch.object(subprocess, 'Popen', side_effect=OSError('boom')):
-            result = start_watcher(1)
+            with patch.object(os, 'close') as close_m:
+                result = start_watcher(1)
         self.assertIsNone(result)
+        # Both pipe ends are released when there is no child to write one.
+        closed = [call.args[0] for call in close_m.call_args_list]
+        self.assertEqual(len(closed), 2)
 
 
 if __name__ == '__main__':

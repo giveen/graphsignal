@@ -39,6 +39,7 @@ graphsignal-run sglang serve --model-path <model> --port 8000
 graphsignal-run ninfer-serve <model> <NInfer options>
 graphsignal-run ninfer <model> --prompt "Explain speculative decoding."
 graphsignal-run trtllm-serve <model> --port 8000
+graphsignal-run llama-server <model> --port 8080
 graphsignal-run python my_app.py
 ```
 
@@ -154,7 +155,7 @@ Then read `http://127.0.0.1:18259/signals` locally either way. On Linux, `docker
 - `cuda_memcpy_nanoseconds` / `cuda_memset_nanoseconds` / `cuda_sync_nanoseconds` — profiles of cumulative time per transfer kind / sync type; `cuda_memcpy_bytes{kind}` / `cuda_memset_bytes{kind}` counters carry the volumes.
 - `gpu_*` — NVML telemetry per device (utilization, memory, power, clocks, throttling, NVLink/PCIe, `gpu_xid_critical_errors`).
 - `process_*`, `host_*` — CPU/memory per process and host.
-- Engine metrics scraped from Prometheus (vLLM `vllm:*`, SGLang `sglang:*`, TRT-LLM) appear under their original names. Both `histogram` and `summary` families become one Graphsignal histogram: exact `count`/`sum` always, plus `p50`/`p95` where the family exposes `le` buckets.
+- Engine metrics scraped from Prometheus (vLLM `vllm:*`, SGLang `sglang:*`, TRT-LLM) appear under their original names. Both `histogram` and `summary` families become one Graphsignal histogram: exact `count`/`sum` always, plus `p50`/`p95` where the family exposes `le` buckets. llama.cpp appears as `llamacpp:*`; the dedicated launcher enables `llama-server --metrics` and derives the scrape host/port from `--host`/`--port` (defaults `127.0.0.1:8080`).
 - NInfer appears as `ninfer_*`: request latency distributions, token throughput, scheduler state, host/device-wait exposure, context-cache activity, transfers, pressure, and speculative-decoding acceptance. The dedicated launcher automatically enables NInfer's structured request log; no Prometheus endpoint or manual flag is required.
 - User probe metrics (see GPU probes below) appear under their registered names.
 
@@ -164,7 +165,7 @@ Then read `http://127.0.0.1:18259/signals` locally either way. On Linux, `docker
 2. Check `gpu_utilization_percent` and `gpu_memory_*` per device — is the GPU busy, starved, or memory-bound?
 3. Read the `cuda_kernels_nanoseconds` and `cuda_graphs_nanoseconds` profiles — which frames dominate cumulative time (they are sorted descending)? If the graph profile holds most of the GPU time and the kernel profile looks thin, the engine replays CUDA graphs and you are seeing whole replays; rerun with `--cuda-graph-trace node` to rank the kernels inside the graph. `cuda_graph_trace_mode` says which mode produced the payload you are reading.
 4. Check the `cuda_sync_nanoseconds` profile and `cuda_memcpy_nanoseconds` profile/byte counters — heavy host synchronization or transfer volume signals CPU/IO bottlenecks.
-5. Correlate with engine metrics (queue depth, running requests, token throughput) from the Prometheus import, or NInfer's `ninfer_*` request/scheduler metrics and bounded NVTX phase aggregates.
+5. Correlate with engine metrics (queue depth, running requests, token throughput) from the Prometheus import, including `llamacpp:*` for llama-server, or NInfer's `ninfer_*` request/scheduler metrics and bounded NVTX phase aggregates.
 
 Each read is the latest snapshot; trends come from diffing cumulative counts/sums between reads. When and how often to read is yours to decide — per benchmark run, per iteration, or continuously.
 
@@ -213,6 +214,14 @@ curl -fsSL https://raw.githubusercontent.com/graphsignal/graphsignal/main/includ
 ```
 
 **Build requirements.** The file you edit is usually one `nvcc` (or `hipcc`) compiles, since the probe goes inside the kernel. Compile that translation unit with `-std=c++17` and put the vendored directory on the include path — `nvcc -std=c++17 -Ithird_party ...`. The header `#error`s on anything older, so a target still defaulting to `gnu++14` fails immediately and reads like a broken header. For device probes also vendor `probe_cuda.h` (or `probe_rocm.h`) beside `probe.h`.
+
+**Executables need one linker flag.** The profiler finds probes through `dlsym(RTLD_DEFAULT, "__graphsignal_probe_registry_v1")`, and an executable's symbols are not in the dynamic symbol table unless you ask for them. Probes compiled into a shared library are found with no extra flags; probes compiled into the executable itself (an app that *is* the engine, like a `ninfer-serve` binary) are silently not — the registry is never published and no probe values show up in `/signals`. Link such a target with:
+
+```
+-Wl,--export-dynamic-symbol=__graphsignal_probe_registry_v1
+```
+
+(`-Wl,--export-dynamic` exports everything, so it also works, and is the flag to reach for if the build system makes a per-symbol flag awkward.) Note the registry already carries `visibility("default")`, so a `-fvisibility=hidden` build is fine — this is purely about the dynamic symbol table.
 
 Four instrument types, registered once (idempotent per name+tags) and recorded lock-free; every record function is a safe no-op on NULL:
 

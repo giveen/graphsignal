@@ -10,6 +10,18 @@ def free_port() -> int:
         return s.getsockname()[1]
 
 
+def wait_for(predicate, timeout: float = 5.0, interval: float = 0.05) -> bool:
+    """Wait for a background condition to become true (e.g. the /signals
+    endpoint's bind retry loop picking up a freed port). True if it became
+    true before the timeout."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(interval)
+    return bool(predicate())
+
+
 def clear_graphsignal_env() -> None:
     """Remove GRAPHSIGNAL_* env vars so tests see only explicit config."""
     for key in list(os.environ.keys()):

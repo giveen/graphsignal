@@ -3,6 +3,7 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
 from typing import List, Optional
 
 logger = logging.getLogger('graphsignal')
@@ -95,16 +96,56 @@ def start_watcher(pid: int,
     if listen_port is not None:
         cmd.extend(['--listen-port', str(int(listen_port))])
 
+    # The child runs with stderr discarded, so a failure inside it — a port
+    # already in use, say — is invisible from out here. Give it a pipe to
+    # report the /signals endpoint's bind state on, and log what it says.
+    read_fd, write_fd = os.pipe()
+    cmd.extend(['--status-fd', str(write_fd)])
     logger.debug('Starting graphsignal-watch: %s', ' '.join(cmd))
     try:
-        return subprocess.Popen(
+        process = subprocess.Popen(
             cmd,
             start_new_session=True,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             stdin=subprocess.DEVNULL,
             close_fds=True,
+            pass_fds=(write_fd,),
         )
     except Exception as exc:
         logger.error('Failed to start graphsignal-watch: %s', exc, exc_info=True)
+        os.close(read_fd)
         return None
+    finally:
+        # The child owns the write end now; dropping ours lets the reader
+        # thread see EOF when it exits.
+        os.close(write_fd)
+
+    threading.Thread(
+        target=_log_status_lines, args=(read_fd,),
+        name='graphsignal-watch-status', daemon=True).start()
+    return process
+
+
+def _log_status_lines(read_fd: int) -> None:
+    """Relay the watcher's status lines to this process's log.
+
+    A bind failure is a warning: the user has no /signals endpoint and the
+    reason is otherwise not in the workload's log. Everything else is debug.
+    """
+    try:
+        stream = os.fdopen(read_fd, 'r')
+    except OSError:
+        # The pipe is gone (interpreter teardown, an unusual close_fds setup).
+        # Losing status relay is not worth an unhandled thread exception.
+        logger.debug('graphsignal-watch status pipe unavailable', exc_info=True)
+        return
+    with stream:
+        for line in stream:
+            line = line.strip()
+            if not line:
+                continue
+            if line.startswith('signals-endpoint bind_failed'):
+                logger.warning('graphsignal-watch: %s', line)
+            else:
+                logger.debug('graphsignal-watch: %s', line)
