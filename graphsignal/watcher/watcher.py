@@ -169,6 +169,7 @@ class Watcher:
         from graphsignal.recorders.nvml_recorder import NVMLRecorder
         from graphsignal.recorders.prometheus_recorder import PrometheusRecorder
         from graphsignal.recorders.ninfer_recorder import NInferRecorder
+        from graphsignal.recorders.ninfer_bench_recorder import NinferBenchRecorder
         from graphsignal.watcher.version_check import start_version_check
 
         # Fires here rather than at setup: this callback runs exactly once, when
@@ -195,6 +196,10 @@ class Watcher:
         # registered unconditionally after the other root recorders: setup
         # decides whether there is a request log to tail.
         recorders.append(NInferRecorder(
+            root_pid=self._target_pid, pid=self._target_pid, args=args))
+        # Likewise for the benchmark harness, which writes a report rather
+        # than a request log and never both.
+        recorders.append(NinferBenchRecorder(
             root_pid=self._target_pid, pid=self._target_pid, args=args))
 
         active_recorders = []

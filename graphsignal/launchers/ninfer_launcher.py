@@ -10,7 +10,8 @@ from graphsignal.profilers.rocm_profiler import RocmProfiler
 
 logger = logging.getLogger('graphsignal')
 
-_NINFER_NAMES = {'ninfer', 'ninfer-serve', 'ninfer-perplexity'}
+_NINFER_NAMES = {'ninfer', 'ninfer-serve', 'ninfer-perplexity',
+                 'ninfer-bench', 'ninfer_bench'}
 _REQUEST_LOG_FLAG = '--request-log-jsonl'
 _REQUEST_LOG_ENV = 'GRAPHSIGNAL_NINFER_JSONL'
 _NVTX_ENV = 'GRAPHSIGNAL_NINFER_NVTX'
@@ -39,6 +40,9 @@ class NinferLauncher(BaseLauncher):
             os.environ.setdefault('NVTX_INJECTION64_PATH', cuda_injection)
         temporary_log = None
         try:
+            # The request log is a serve-only flag; ninfer_bench would reject
+            # it as unknown. The bench reports through its own JSON report,
+            # which NinferBenchRecorder imports instead.
             if self.executable_name() == 'ninfer-serve':
                 args, request_log, request_log_supplied = _ensure_request_log(args)
                 if not request_log_supplied:

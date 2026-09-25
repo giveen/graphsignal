@@ -15,6 +15,9 @@ class NinferMatchTest(unittest.TestCase):
         self.assertTrue(NinferLauncher(['ninfer-serve', 'm']).match())
         self.assertTrue(NinferLauncher(['ninfer-perplexity', 'm']).match())
         self.assertTrue(NinferLauncher(['/opt/ninfer/bin/ninfer']).match())
+        # The benchmark harness, in both spellings the build produces.
+        self.assertTrue(NinferLauncher(['ninfer-bench', 'm']).match())
+        self.assertTrue(NinferLauncher(['build/bench/ninfer_bench']).match())
 
     def test_does_not_match_other_commands(self):
         self.assertFalse(NinferLauncher(['python', 'app.py']).match())
@@ -45,6 +48,32 @@ class NinferLaunchTest(unittest.TestCase):
         self.assertEqual(
             fx.launched_argv,
             ['/abs/exec', '--foo', 'bar'])
+
+    def test_bench_preserves_argv_and_adds_no_request_log(self):
+        # The request log is a serve-only flag: appending it would make the
+        # harness exit on an unknown argument. Its report path is the user's
+        # to choose, so argv passes through byte-for-byte.
+        launcher = NinferLauncher([
+            'build/bench/ninfer_bench', '--weights', 'm.ninfer',
+            '-o', 'json', '--output-file', 'out.json'])
+        with LaunchFixture(ninfer_mod) as fx:
+            with patch.dict(os.environ, {}, clear=False):
+                os.environ.pop(NinferLaunchTest.ENV_VAR, None)
+                launcher.launch()
+        self.assertEqual(
+            fx.launched_argv,
+            ['/abs/exec', '--weights', 'm.ninfer', '-o', 'json',
+             '--output-file', 'out.json'])
+        self.assertNotIn(NinferLaunchTest.ENV_VAR, os.environ)
+
+    def test_bench_still_enables_the_ninfer_nvtx_domain(self):
+        # The bench shares the engine, so it needs the same NVTX opt-in the
+        # serve path gets.
+        launcher = NinferLauncher(['build/bench/ninfer_bench', 'm.ninfer'])
+        with LaunchFixture(ninfer_mod) as fx:
+            launcher.launch()
+        fx.cupti_env_m.assert_called_once_with(cuda_graph_trace=None)
+        self.assertEqual(os.environ.get('GRAPHSIGNAL_NINFER_NVTX'), '1')
 
     def test_serve_injects_unique_request_log_and_exports_it(self):
         paths = []
