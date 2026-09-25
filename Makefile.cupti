@@ -270,7 +270,7 @@ $(TEST_CUPTI_OUT): $(TEST_CUPTI_TEST_OBJ) $(TEST_CUPTI_OTHER_OBJ) | $(BUILD_DIR)
 	@echo "Linking test: $@"
 	$(NVCC) $(TEST_CUPTI_LDFLAGS) -o "$@" $(TEST_CUPTI_TEST_OBJ) $(TEST_CUPTI_OTHER_OBJ) $(TEST_CUPTI_LDLIBS)
 
-$(TEST_CUPTI_TEST_OBJ): $(TEST_CUPTI_TEST_SRC) | $(BUILD_DIR)
+$(TEST_CUPTI_TEST_OBJ): $(TEST_CUPTI_TEST_SRC) include/graphsignal/probe.h src/common/metrics_writer.h | $(BUILD_DIR)
 	@echo "Compiling test file with nvcc: $@"
 	$(NVCC) $(NVCCFLAGS) -x cu -c -o "$@" $(TEST_CUPTI_TEST_SRC)
 
@@ -288,7 +288,12 @@ $(TEST_NVTX_OUT): $(TEST_NVTX_SRC) src/cupti/nvtx_ranges.cpp src/cupti/nvtx_rang
 	@echo "Building test: $@"
 	$(CXX) -std=c++17 -O2 -Wall -Wextra -Iinclude -Isrc/common -pthread -o "$@" $(TEST_NVTX_SRC) src/cupti/nvtx_ranges.cpp -ldl
 
-$(BUILD_DIR)/cupti_activity.o: src/cupti/cupti_activity.cpp | $(BUILD_DIR)
+# Header deps matter here: this object and nvtx_ranges.o are separate
+# translation units that must agree on the layout of NvtxRangeAggregator and
+# MetricsWriter. Without them, changing a header rebuilds only one of the two
+# and the mismatch corrupts memory at run time.
+$(BUILD_DIR)/cupti_activity.o: src/cupti/cupti_activity.cpp src/cupti/cupti_activity.h \
+                            src/cupti/nvtx_ranges.h src/common/metrics_writer.h | $(BUILD_DIR)
 	@echo "Compiling cupti_activity.cpp with g++: $@"
 	@if [[ ! -f "$(CUPTI_INCLUDE_DIR)/cupti.h" ]]; then \
 		echo "Error: cupti.h not found under $(CUPTI_INCLUDE_DIR)"; \
