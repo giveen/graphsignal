@@ -59,6 +59,7 @@ graphsignal-run sglang serve --model-path <model> --port 8000
 graphsignal-run trtllm-serve <model> --port 8000
 graphsignal-run llama-server <model> --port 8080
 graphsignal-run ninfer-serve <model> <NInfer options>
+graphsignal-run ninfer_bench <args> -o json --output-file report.json   # see below
 graphsignal-run ninfer <model> --prompt "Explain speculative decoding."
 graphsignal-run python my_app.py
 ```
@@ -73,7 +74,7 @@ Options (before the command):
 | `--listen-port PORT` | Port for the `/signals` endpoint (default: `18259`). |
 | `--cuda-graph-trace {graph\|node}` | Granularity for CUDA graph launches (default: `graph`). `graph` times each replay as a whole into `cuda_graphs_nanoseconds`; `node` times the kernels inside the graph individually into `cuda_kernels_nanoseconds`. Also settable via `GRAPHSIGNAL_CUDA_GRAPH_TRACE`; the flag wins. |
 
-Engine notes: the SGLang launcher adds `--enable-metrics` so the Prometheus endpoint is available; the vLLM launcher removes `--disable-log-stats` for the same reason. The llama.cpp launcher adds `--metrics` so `llama-server` exposes its `/metrics` endpoint, then Graphsignal imports the `llamacpp:*` token, throughput, slot, cache, and speculative-decoding metrics. The NInfer launcher automatically enables NInfer's structured `--request-log-jsonl`, which supplies its `ninfer_*` request and engine metrics. NInfer does not expose a Prometheus metrics endpoint, so no metrics scrape is configured for it. Everything else on the command line is passed through unchanged.
+Engine notes: the SGLang launcher adds `--enable-metrics` so the Prometheus endpoint is available; the vLLM launcher removes `--disable-log-stats` for the same reason. The llama.cpp launcher adds `--metrics` so `llama-server` exposes its `/metrics` endpoint, then Graphsignal imports the `llamacpp:*` token, throughput, slot, cache, and speculative-decoding metrics. The NInfer launcher automatically enables NInfer's structured `--request-log-jsonl`, which supplies its `ninfer_*` request and engine metrics. NInfer does not expose a Prometheus metrics endpoint, so no metrics scrape is configured for it. The NInfer benchmark harness (`ninfer_bench`) is supported too: wrap it with `-o json --output-file <path>` and its report is imported as the same `ninfer_*` metrics, tagged per test (`{test: "pp2048+tg128"}`), so benchmark results line up with served runs. Everything else on the command line is passed through unchanged.
 
 
 ## Optimization loop

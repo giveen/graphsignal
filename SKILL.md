@@ -37,6 +37,7 @@ Wrap the workload's launch command:
 graphsignal-run vllm serve Qwen/Qwen2.5-1.5B-Instruct --port 8000
 graphsignal-run sglang serve --model-path <model> --port 8000
 graphsignal-run ninfer-serve <model> <NInfer options>
+graphsignal-run ninfer_bench <args> -o json --output-file report.json   # see below
 graphsignal-run ninfer <model> --prompt "Explain speculative decoding."
 graphsignal-run trtllm-serve <model> --port 8000
 graphsignal-run llama-server <model> --port 8080
@@ -157,6 +158,7 @@ Then read `http://127.0.0.1:18259/signals` locally either way. On Linux, `docker
 - `process_*`, `host_*` — CPU/memory per process and host.
 - Engine metrics scraped from Prometheus (vLLM `vllm:*`, SGLang `sglang:*`, TRT-LLM) appear under their original names. Both `histogram` and `summary` families become one Graphsignal histogram: exact `count`/`sum` always, plus `p50`/`p95` where the family exposes `le` buckets. llama.cpp appears as `llamacpp:*`; the dedicated launcher enables `llama-server --metrics` and derives the scrape host/port from `--host`/`--port` (defaults `127.0.0.1:8080`).
 - NInfer appears as `ninfer_*`: request latency distributions, token throughput, scheduler state, host/device-wait exposure, context-cache activity, transfers, pressure, and speculative-decoding acceptance. The dedicated launcher automatically enables NInfer's structured request log; no Prometheus endpoint or manual flag is required.
+- NInfer's benchmark harness (`ninfer_bench`) is profiled the same way, from its own report rather than the request log: wrap it as `graphsignal-run ninfer_bench <args> -o json --output-file <path>`. The report is imported as the same `ninfer_*` metrics with the test label as a `test` tag — `ninfer_request_decode_seconds{test: "tg128"}`, `ninfer_throughput_prefill_tokens_per_second{test: "pp2048"}`, `ninfer_speculative_acceptance_rate{test: "tg128", backend: "mtp"}` — plus run-scoped `bench.*` tags (model, kv_cache, speculative_backend, cuda_graph, repetitions) and the startup memory gauges. Two caveats: the harness writes the report as its last act before exiting, so read the metrics via the uploaded signals (an API key) rather than a local `/signals` curl after the run; and the report carries no bin grid, so its histograms have exact `count`/`sum`/`min`/`max` with `p50`/`p95` as `null` — compare `mean`, `min`, and `max`.
 - User probe metrics (see GPU probes below) appear under their registered names.
 
 ### How to interpret (suggested order)
