@@ -89,9 +89,14 @@ class NinferLaunchTest(unittest.TestCase):
                 paths.append(path)
                 self.assertFalse(os.path.exists(path))
                 self.assertEqual(os.environ[self.ENV_VAR], path)
-        self.assertEqual(os.environ['GRAPHSIGNAL_NINFER_NVTX'], '1')
-        self.assertEqual(os.environ.get('NVTX_INJECTION64_PATH'),
-                         os.environ.get('CUDA_INJECTION64_PATH'))
+            # Read inside the patch: the launcher sets these, and the patch
+            # rolls them back on exit, so asserting outside it depends on
+            # whatever the ambient environment happened to hold. The NVTX
+            # library comparison stays an equality because the launcher
+            # setdefault()s it, and an already-set value legitimately wins.
+            self.assertEqual(os.environ['GRAPHSIGNAL_NINFER_NVTX'], '1')
+            self.assertEqual(os.environ.get('NVTX_INJECTION64_PATH'),
+                             os.environ.get('CUDA_INJECTION64_PATH'))
 
         self.assertNotEqual(paths[0], paths[1])
 
