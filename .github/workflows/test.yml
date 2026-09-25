@@ -52,5 +52,5 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Probe header and writer tests
-        run: make -f Makefile.cupti test-probe test-common
+      - name: Probe, writer, and NVTX tests
+        run: make -f Makefile.cupti test-probe test-common test-nvtx

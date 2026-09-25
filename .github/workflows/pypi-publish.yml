@@ -25,9 +25,10 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          # 3.11+ for `tomllib` in the version check below. The wheel is pure
-          # Python plus committed native libraries, so this version only runs
-          # the release steps; the supported range is tested by test.yml.
+          # 3.11+ for `tomllib` in the version check below. The wheel installs
+          # independently of the host architecture and loads its committed
+          # native libraries at runtime; this Python only runs release steps,
+          # while the supported range is tested by test.yml.
           python-version: '3.12'
 
       - name: Check the tag against both places the version is written
@@ -85,8 +86,8 @@ jobs:
 
       - name: Check the wheel carries the prebuilt native libraries
         # The CUPTI and ROCm injection libraries are committed under
-        # graphsignal/_native/ and included by pyproject's native include. A wheel
-        # without them installs cleanly, runs cleanly, and profiles no GPU at
+        # graphsignal/_native/ and included by pyproject's native include. A
+        # wheel without them installs cleanly, runs cleanly, and profiles no GPU at
         # all — the failure is silent and only visible on a GPU box, so it is
         # checked here rather than discovered there.
         # Done entirely in Python: finding the wheel through `ls` makes the

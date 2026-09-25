@@ -1,7 +1,7 @@
 ---
 name: graphsignal
 description: >-
-  Profile AI inference workloads (vLLM, SGLang, TensorRT-LLM, PyTorch, any GPU
+  Profile AI inference workloads (vLLM, SGLang, TensorRT-LLM, NInfer, PyTorch, any GPU
   application) with the Graphsignal profiler and read the results from its
   local /signals JSON endpoint. Use when the user wants GPU profiling,
   kernel/CUDA-graph timing, engine metrics, or error monitoring for a workload,
@@ -13,7 +13,7 @@ description: >-
 
 Graphsignal is a GPU profiler built to be operated by an AI agent: install it, launch the workload under it, benchmark it, read the signals, change flags or code, measure again.
 
-It observes a workload from a **sidecar process**: `graphsignal-run` launches the workload unmodified — no code changes, no imports — injects the CUPTI/ROCm activity library into it, and starts a watcher process that collects everything and serves it as one JSON document at `http://127.0.0.1:18259/signals`. Collected out of the box: GPU kernel/graph/transfer/sync timing (CUDA and ROCm), NVML device telemetry, process and host metrics, the engine's own Prometheus metrics (vLLM, SGLang, TensorRT-LLM), and errors extracted from console output. No profiling data is uploaded anywhere unless `GRAPHSIGNAL_API_KEY` is set.
+It observes a workload from a **sidecar process**: `graphsignal-run` launches the workload, injects the CUPTI/ROCm activity library into it, and starts a watcher process that collects everything and serves it as one JSON document at `http://127.0.0.1:18259/signals`. Collected out of the box: GPU kernel/graph/transfer/sync timing (CUDA and ROCm), NVML device telemetry, process and host metrics, Prometheus engine metrics (vLLM, SGLang, TensorRT-LLM), direct `ninfer_*` request and engine metrics for NInfer, and errors extracted from console output. No profiling data is uploaded anywhere unless `GRAPHSIGNAL_API_KEY` is set.
 
 ## Install
 
@@ -36,13 +36,15 @@ Wrap the workload's launch command:
 ```bash
 graphsignal-run vllm serve Qwen/Qwen2.5-1.5B-Instruct --port 8000
 graphsignal-run sglang serve --model-path <model> --port 8000
+graphsignal-run ninfer-serve <model> <NInfer options>
+graphsignal-run ninfer <model> --prompt "Explain speculative decoding."
 graphsignal-run trtllm-serve <model> --port 8000
 graphsignal-run python my_app.py
 ```
 
 Leading flags (before the command):
 
-- `--metrics-port PORT` — where to scrape the engine's Prometheus metrics (default: derived from the engine's `--port`).
+- `--metrics-port PORT` — where to scrape the engine's Prometheus metrics (default: derived from the engine's `--port`). It does not apply to NInfer, which supplies its own structured request log instead.
 - `--listen-host HOST` — host to bind the `/signals` endpoint to (default `127.0.0.1`; set e.g. `0.0.0.0` to expose it for remote access; also settable via `GRAPHSIGNAL_LISTEN_HOST`).
 - `--listen-port PORT` — port for the `/signals` endpoint (default `18259`; also settable via `GRAPHSIGNAL_LISTEN_PORT`).
 - `--cuda-graph-trace {graph|node}` — granularity for CUDA graph launches (default `graph`; also settable via `GRAPHSIGNAL_CUDA_GRAPH_TRACE`). `graph` times each graph replay as a whole into `cuda_graphs_nanoseconds`. `node` times the kernels *inside* the graph individually into `cuda_kernels_nanoseconds` and leaves `cuda_graphs_nanoseconds` empty — that is how you rank kernels in an engine that replays CUDA graphs (vLLM, SGLang, TensorRT-LLM, llama.cpp in decode). It needs no extra privileges; it costs more CUPTI work per replay, so use it for an investigation, not for a long-running production run. Ignored on ROCm, where every dispatch is reported individually anyway.
@@ -153,6 +155,7 @@ Then read `http://127.0.0.1:18259/signals` locally either way. On Linux, `docker
 - `gpu_*` — NVML telemetry per device (utilization, memory, power, clocks, throttling, NVLink/PCIe, `gpu_xid_critical_errors`).
 - `process_*`, `host_*` — CPU/memory per process and host.
 - Engine metrics scraped from Prometheus (vLLM `vllm:*`, SGLang `sglang:*`, TRT-LLM) appear under their original names. Both `histogram` and `summary` families become one Graphsignal histogram: exact `count`/`sum` always, plus `p50`/`p95` where the family exposes `le` buckets.
+- NInfer appears as `ninfer_*`: request latency distributions, token throughput, scheduler state, host/device-wait exposure, context-cache activity, transfers, pressure, and speculative-decoding acceptance. The dedicated launcher automatically enables NInfer's structured request log; no Prometheus endpoint or manual flag is required.
 - User probe metrics (see GPU probes below) appear under their registered names.
 
 ### How to interpret (suggested order)
@@ -161,7 +164,7 @@ Then read `http://127.0.0.1:18259/signals` locally either way. On Linux, `docker
 2. Check `gpu_utilization_percent` and `gpu_memory_*` per device — is the GPU busy, starved, or memory-bound?
 3. Read the `cuda_kernels_nanoseconds` and `cuda_graphs_nanoseconds` profiles — which frames dominate cumulative time (they are sorted descending)? If the graph profile holds most of the GPU time and the kernel profile looks thin, the engine replays CUDA graphs and you are seeing whole replays; rerun with `--cuda-graph-trace node` to rank the kernels inside the graph. `cuda_graph_trace_mode` says which mode produced the payload you are reading.
 4. Check the `cuda_sync_nanoseconds` profile and `cuda_memcpy_nanoseconds` profile/byte counters — heavy host synchronization or transfer volume signals CPU/IO bottlenecks.
-5. Correlate with engine metrics (queue depth, running requests, token throughput) from the Prometheus import.
+5. Correlate with engine metrics (queue depth, running requests, token throughput) from the Prometheus import, or NInfer's `ninfer_*` request/scheduler metrics and bounded NVTX phase aggregates.
 
 Each read is the latest snapshot; trends come from diffing cumulative counts/sums between reads. When and how often to read is yours to decide — per benchmark run, per iteration, or continuously.
 
@@ -298,7 +301,7 @@ If you find a **real bug in the profiler** — not a misconfiguration and not a 
 
 It is a profiler bug when the profiler itself misbehaves: it crashes or hangs, `/signals` returns malformed JSON or an obviously wrong value (a negative duration, a counter that decreases, a metric that vanishes while the workload is plainly still doing the work), a probe that registered never appears, `graphsignal-run` mangles the command line it was given, or the profiler changes the workload's behavior.
 
-It is **not** a profiler bug when: the workload itself fails (read `errors` and the console output — a CUDA OOM or an engine argument error is the workload's), a metric is `null` because nothing measured it (no GPU, no Prometheus endpoint, no `cu12`/`cu13` extra installed), `/signals` is unreachable because the workload already exited or is bound to another port, or a probe returned `NULL` at registration (check `graphsignal_probe_dropped_instruments`). Rule out all of these first — say which ones you ruled out in the report.
+It is **not** a profiler bug when: the workload itself fails (read `errors` and the console output — a CUDA OOM or an engine argument error is the workload's), a metric is `null` because nothing measured it (no GPU, no applicable Prometheus endpoint, no `cu12`/`cu13` extra installed), `/signals` is unreachable because the workload already exited or is bound to another port, NInfer has no Prometheus endpoint, or a probe returned `NULL` at registration (check `graphsignal_probe_dropped_instruments`). Rule out all of these first — say which ones you ruled out in the report.
 
 Collect, and reproduce with `GRAPHSIGNAL_DEBUG=1` before writing it up:
 

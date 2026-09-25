@@ -8,7 +8,7 @@ Graphsignal is a GPU profiler for AI agents to autonomously optimize inference p
 * GPU probes: a vendorable C++ header to instrument code and kernels — by hand, or by an agent.
 * GPU telemetry via NVML: utilization, memory, power, clocks, throttling, NVLink/PCIe throughput, XID errors.
 * Process and host metrics: CPU, memory, command lines, runtimes.
-* Inference engine metrics imported from Prometheus endpoints (vLLM, SGLang, TensorRT-LLM).
+* Inference engine metrics imported from Prometheus endpoints (vLLM, SGLang, TensorRT-LLM) or emitted directly by NInfer as `ninfer_*` metrics.
 * Error capture from engine console output, including crashes and tracebacks.
 * Local `/signals` HTTP endpoint serving metric statistics, recent errors, and resources as JSON.
 
@@ -57,6 +57,8 @@ Works with any command:
 ```bash
 graphsignal-run sglang serve --model-path <model> --port 8000
 graphsignal-run trtllm-serve <model> --port 8000
+graphsignal-run ninfer-serve <model> <NInfer options>
+graphsignal-run ninfer <model> --prompt "Explain speculative decoding."
 graphsignal-run python my_app.py
 ```
 
@@ -70,7 +72,7 @@ Options (before the command):
 | `--listen-port PORT` | Port for the `/signals` endpoint (default: `18259`). |
 | `--cuda-graph-trace {graph\|node}` | Granularity for CUDA graph launches (default: `graph`). `graph` times each replay as a whole into `cuda_graphs_nanoseconds`; `node` times the kernels inside the graph individually into `cuda_kernels_nanoseconds`. Also settable via `GRAPHSIGNAL_CUDA_GRAPH_TRACE`; the flag wins. |
 
-Engine notes: the SGLang launcher adds `--enable-metrics` so the Prometheus endpoint is available; the vLLM launcher removes `--disable-log-stats` for the same reason. Everything else on the command line is passed through unchanged.
+Engine notes: the SGLang launcher adds `--enable-metrics` so the Prometheus endpoint is available; the vLLM launcher removes `--disable-log-stats` for the same reason. The NInfer launcher automatically enables NInfer's structured `--request-log-jsonl`, which supplies its `ninfer_*` request and engine metrics. NInfer does not expose a Prometheus metrics endpoint, so no metrics scrape is configured for it. Everything else on the command line is passed through unchanged.
 
 
 ## Optimization loop
@@ -93,6 +95,8 @@ The response contains:
 The endpoint is what closes the loop: an AI agent launches the workload under `graphsignal-run`, polls `/signals` under load, reads which kernels, transfers, or synchronization dominate, changes flags or code, and measures again. [SKILL.md](SKILL.md) teaches an agent the payload semantics and how to interpret it; see the [AI Optimization guide](https://graphsignal.com/docs/guides/ai-optimization/) for the full workflow.
 
 Engines that capture their decode step into a CUDA graph — vLLM, SGLang, TensorRT-LLM, llama.cpp — replay one graph per token, so by default their decode time arrives as whole replays in `cuda_graphs_nanoseconds` and `cuda_kernels_nanoseconds` holds only the eager (prefill) kernels. When the loop needs a per-kernel ranking, relaunch with `--cuda-graph-trace node`: the same kernels then appear in `cuda_kernels_nanoseconds` by symbol, `cuda_graphs_nanoseconds` goes empty, and the `cuda_graph_trace_mode` gauge records which granularity produced the payload. It needs no elevated privileges — it is an investigation mode, not a deployment default (see Overhead).
+
+NInfer follows the same distinction for its exact-batch graph decode. Its `ninfer_*` request, scheduler, cache, and speculative-decoding metrics are independent of graph/node tracing. Graphsignal also imports bounded aggregates from NInfer's `ninfer` NVTX domain, including runtime, engine, prefill, decode, MTP, DFlash/DFlash2, CUDA Graph, Vision, and sparse-MoE ranges. Graphsignal still captures CUDA kernels, graph replays, transfers, and synchronization through CUPTI.
 
 
 ## GPU probes

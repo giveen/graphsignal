@@ -5,6 +5,7 @@ import sys
 from graphsignal.launchers.vllm_launcher import VllmLauncher
 from graphsignal.launchers.sglang_launcher import SglangLauncher
 from graphsignal.launchers.trtllm_launcher import TrtllmLauncher
+from graphsignal.launchers.ninfer_launcher import NinferLauncher
 from graphsignal.launchers.fallback_launcher import FallbackLauncher
 
 log = logging.getLogger(__name__)
@@ -175,6 +176,7 @@ def main():
         VllmLauncher(target_args, **launcher_kwargs),
         SglangLauncher(target_args, **launcher_kwargs),
         TrtllmLauncher(target_args, **launcher_kwargs),
+        NinferLauncher(target_args, **launcher_kwargs),
         FallbackLauncher(target_args, **launcher_kwargs),
     ]
 

@@ -3,6 +3,10 @@
 #include <cupti.h>
 #include <cuda.h>
 
+extern "C" CUptiResult CUPTIAPI cuptiNvtxInitialize(void* pfnGetExportTable);
+#include <generated_nvtx_meta.h>
+#include <nvtx3/nvToolsExt.h>
+
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
@@ -15,6 +19,7 @@
 #include <vector>
 
 #include "metrics_writer.h"
+#include "nvtx_ranges.h"
 
 #ifndef CUPTI_CALL
 #define CUPTI_CALL(call)                                                        \
@@ -95,6 +100,7 @@ static KindInstrument g_memset_bytes[kNumMemsetKinds];
 // CUDA graph instantiation so we can compute a stable structural signature for
 // each executable graph once, off the launch hot path.
 static CUpti_SubscriberHandle g_subscriber{};
+static graphsignal::NvtxRangeAggregator g_nvtx_ranges;
 
 // graphId -> structural signature ("kernel[name=<symbol>,calls=n];" for kernel
 // nodes, "<node_type>[calls=n];" otherwise; sorted, joined). A GRAPH_TRACE
@@ -436,12 +442,78 @@ static bool device_probe_reader(const graphsignal_probe_entry* e,
 // CUPTI resource callback. Observes CUDA graph instantiation so we can compute
 // each graph's structural signature once, off the launch hot path, and key it
 // by the ids that GRAPH_TRACE may use.
+static const char* nvtx_message(const nvtxEventAttributes_t* attrs) {
+  if (!attrs) return nullptr;
+  if (attrs->messageType == NVTX_MESSAGE_TYPE_ASCII) return attrs->message.ascii;
+  // Registered and wide messages require a domain-owned string table. Do not
+  // retain or guess those strings: NInfer's domain ranges use ASCII, and a
+  // missing label is preferable to unbounded callback allocation.
+  return nullptr;
+}
+
 static void CUPTIAPI graph_resource_callback(void* /*userdata*/, CUpti_CallbackDomain domain,
-                                             CUpti_CallbackId cbid, const CUpti_CallbackData* cbdata) {
+                                             CUpti_CallbackId cbid, const void* cbdata) {
   if (!g_running.load(std::memory_order_relaxed)) return;
-  if (domain != CUPTI_CB_DOMAIN_RESOURCE) return;
 
   try {
+    if (domain == CUPTI_CB_DOMAIN_NVTX) {
+      const auto* nd = reinterpret_cast<const CUpti_NvtxData*>(cbdata);
+      if (!nd) return;
+      if (cbid == CUPTI_CBID_NVTX_nvtxDomainCreateA) {
+        const auto* p = reinterpret_cast<const nvtxDomainCreateA_params*>(nd->functionParams);
+        if (p) g_nvtx_ranges.on_domain_create(
+            reinterpret_cast<uintptr_t>(nd->functionReturnValue), p->name);
+      } else if (cbid == CUPTI_CBID_NVTX_nvtxDomainRegisterStringA) {
+        const auto* p = reinterpret_cast<const nvtxDomainRegisterStringA_params*>(nd->functionParams);
+        if (p) g_nvtx_ranges.on_register(reinterpret_cast<uintptr_t>(p->domain),
+                                         reinterpret_cast<uintptr_t>(nd->functionReturnValue),
+                                         p->string);
+      } else if (cbid == CUPTI_CBID_NVTX_nvtxDomainDestroy) {
+        const auto* p = reinterpret_cast<const nvtxDomainDestroy_params*>(nd->functionParams);
+        if (p) g_nvtx_ranges.on_domain_destroy(reinterpret_cast<uintptr_t>(p->domain));
+      } else if (cbid == CUPTI_CBID_NVTX_nvtxDomainRangeStartEx ||
+                 cbid == CUPTI_CBID_NVTX_nvtxDomainRangePushEx) {
+        if (cbid == CUPTI_CBID_NVTX_nvtxDomainRangeStartEx) {
+          const auto* p = reinterpret_cast<const nvtxDomainRangeStartEx_params*>(nd->functionParams);
+          const auto* a = p ? p->core.eventAttrib : nullptr;
+          if (a && a->messageType == NVTX_MESSAGE_TYPE_REGISTERED) {
+            const char* name = g_nvtx_ranges.resolve_registered(
+                reinterpret_cast<uintptr_t>(a->message.registered));
+            g_nvtx_ranges.on_start_category(
+                reinterpret_cast<uintptr_t>(p->domain), a->category, name,
+                reinterpret_cast<uintptr_t>(nd->functionReturnValue), true);
+          } else {
+            g_nvtx_ranges.on_start_category(reinterpret_cast<uintptr_t>(p->domain), a->category,
+                                             nvtx_message(a),
+                                             reinterpret_cast<uintptr_t>(nd->functionReturnValue), true);
+          }
+        } else {
+          const auto* p = reinterpret_cast<const nvtxDomainRangePushEx_params*>(nd->functionParams);
+          const auto* a = p ? p->core.eventAttrib : nullptr;
+          if (a && a->messageType == NVTX_MESSAGE_TYPE_REGISTERED) {
+            const char* name = g_nvtx_ranges.resolve_registered(
+                reinterpret_cast<uintptr_t>(a->message.registered));
+            g_nvtx_ranges.on_start_category(reinterpret_cast<uintptr_t>(p->domain), a->category,
+                                             name, 0, false);
+          } else {
+            g_nvtx_ranges.on_start_category(reinterpret_cast<uintptr_t>(p->domain), a->category,
+                                           nvtx_message(a), 0, false);
+          }
+        }
+      } else if (cbid == CUPTI_CBID_NVTX_nvtxDomainRangeEnd ||
+                 cbid == CUPTI_CBID_NVTX_nvtxDomainRangePop) {
+        if (cbid == CUPTI_CBID_NVTX_nvtxDomainRangeEnd) {
+          const auto* p = reinterpret_cast<const nvtxDomainRangeEnd_params*>(nd->functionParams);
+          if (p) g_nvtx_ranges.on_end(reinterpret_cast<uintptr_t>(p->domain), p->core.id, true);
+        } else {
+          const auto* p = reinterpret_cast<const nvtxDomainRangePop_params*>(nd->functionParams);
+          if (p) g_nvtx_ranges.on_end(reinterpret_cast<uintptr_t>(p->domain), 0, false);
+        }
+      }
+      return;
+    }
+    if (domain != CUPTI_CB_DOMAIN_RESOURCE) return;
+
     const auto* rd = reinterpret_cast<const CUpti_ResourceData*>(cbdata);
     if (!rd || !rd->resourceDescriptor) return;
 
@@ -450,22 +522,14 @@ static void CUPTIAPI graph_resource_callback(void* /*userdata*/, CUpti_CallbackD
         const auto* gd = reinterpret_cast<const CUpti_GraphData*>(rd->resourceDescriptor);
         const std::string sig = compute_graph_signature(gd->graph);
         if (sig.empty()) break;
-        // Register under both the source graph id and the executable graph id;
-        // GRAPH_TRACE's graphId differs across CUDA versions.
         uint32_t id = 0;
-        if (gd->graph && cuptiGetGraphId(gd->graph, &id) == CUPTI_SUCCESS) {
-          register_graph_signature(id, sig);
-        }
-        if (gd->graphExec && cuptiGetGraphExecId(gd->graphExec, &id) == CUPTI_SUCCESS) {
-          register_graph_signature(id, sig);
-        }
+        if (gd->graph && cuptiGetGraphId(gd->graph, &id) == CUPTI_SUCCESS) register_graph_signature(id, sig);
+        if (gd->graphExec && cuptiGetGraphExecId(gd->graphExec, &id) == CUPTI_SUCCESS) register_graph_signature(id, sig);
         break;
       }
-      default:
-        break;
+      default: break;
     }
   } catch (...) {
-    // Never let an exception cross the CUPTI C callback boundary.
   }
 }
 
@@ -662,6 +726,12 @@ int cupti_activity_start(uint64_t write_interval_ns, uint32_t debug_mode,
   g_writer->set_flush_hook(writer_flush_hook, nullptr);
   g_writer->set_device_probe_reader(device_probe_reader, nullptr);
   g_writer->set_device_probe_batch_reader(device_probe_batch_reader, nullptr);
+  g_nvtx_ranges.reset();
+  const char* adopt_ninfer_domain = std::getenv("GRAPHSIGNAL_NINFER_NVTX");
+  g_nvtx_ranges.configure(
+      writer, adopt_ninfer_domain && (adopt_ninfer_domain[0] == '1' ||
+                                     adopt_ninfer_domain[0] == 't' ||
+                                     adopt_ninfer_domain[0] == 'T'));
 
   CUPTI_CALL(cuptiActivityRegisterCallbacks(bufferRequested, bufferCompleted));
 
@@ -695,6 +765,7 @@ int cupti_activity_start(uint64_t write_interval_ns, uint32_t debug_mode,
   if (cuptiSubscribe(&g_subscriber, (CUpti_CallbackFunc)graph_resource_callback,
                      nullptr) == CUPTI_SUCCESS) {
     CUPTI_CALL(cuptiEnableDomain(1, g_subscriber, CUPTI_CB_DOMAIN_RESOURCE));
+    CUPTI_CALL(cuptiEnableDomain(1, g_subscriber, CUPTI_CB_DOMAIN_NVTX));
   }
 
   std::atexit([]() { cupti_activity_stop(); });
@@ -741,6 +812,7 @@ void cupti_activity_stop(void) {
     g_writer->debug("cupti_activity_stop");
     g_writer->shutdown();
   }
+  g_nvtx_ranges.reset();
 
   // Safe now: cuptiFinalize() has unregistered the callbacks, so nothing can
   // call buffer_pool_acquire/release afterward.
@@ -778,6 +850,10 @@ static const char* read_env_string(const char* name, const char* def) {
 }
 
 extern "C" {
+
+int InitializeInjectionNvtx(void* pfnGetExportTable) {
+  return cuptiNvtxInitialize(pfnGetExportTable) == CUPTI_SUCCESS ? 1 : 0;
+}
 
 uint32_t cupti_activity_graph_trace_mode_from_env(void) {
   g_graph_trace_env_invalid[0] = '\0';
