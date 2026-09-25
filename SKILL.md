@@ -151,11 +151,14 @@ Then read `http://127.0.0.1:18259/signals` locally either way. On Linux, `docker
 ### Key metric families
 
 - `cuda_kernels_nanoseconds` / `rocm_kernels_nanoseconds` — profile of cumulative execution time per kernel (frames are raw mangled symbols). **In the default graph mode this holds only eagerly launched kernels**: kernels replayed from a CUDA graph are reported as their graph instead. Rerun with `--cuda-graph-trace node` to get them here.
-- `cuda_graphs_nanoseconds` — profile of cumulative replay time per unique CUDA-graph structure (frames are 16-hex structural signatures). Empty in node mode.
+- `cuda_graphs_nanoseconds` — profile of cumulative replay time per unique CUDA-graph structure. Each frame names what the graph contains plus a short structural hash, e.g. `flash_attn_fwd*3+rms_norm*2 [a1b2c3d4]`; the hash keeps two structurally different graphs apart when their labels agree. Empty in node mode.
 - `cuda_graph_trace_mode` — gauge, the graph tracing granularity in effect: `0` = graph (default), `1` = node. Read it before concluding anything from an empty `cuda_graphs_nanoseconds` or a sparse `cuda_kernels_nanoseconds`.
 - `cuda_memcpy_nanoseconds` / `cuda_memset_nanoseconds` / `cuda_sync_nanoseconds` — profiles of cumulative time per transfer kind / sync type; `cuda_memcpy_bytes{kind}` / `cuda_memset_bytes{kind}` counters carry the volumes.
+- `cuda_dropped_records_total` — counter of CUPTI records the driver never delivered (buffer overflow under load). **Non-zero means the timings above are incomplete**, not that the workload was idle. It is always present, so `0` is a positive result.
+- `cuda_api_nanoseconds` — profile of CUDA runtime API call time, **only with `GRAPHSIGNAL_CUDA_API_TRACE` set** (off by default, so it costs nothing otherwise). `1` traces the allocation and graph-lifecycle APIs (`cudaMalloc`, `cudaFree`, `cudaMallocAsync`, `cudaFreeAsync`, `cudaHostAlloc`, `cudaHostRegister`, `cudaGraphInstantiate*`, `cudaGraphLaunch`, `cudaGraphExecUpdate`); a comma-separated list traces exactly those; `all` traces every runtime API, which is the expensive nsys-equivalent mode. This is where allocator churn and graph rebuild cost show up — both are invisible to kernel/memcpy/sync timing. Set it for an investigation, then turn it off.
 - `gpu_*` — NVML telemetry per device (utilization, memory, power, clocks, throttling, NVLink/PCIe, `gpu_xid_critical_errors`).
 - `process_*`, `host_*` — CPU/memory per process and host.
+- Host-bound triage, no privileges needed: `process_user_cpu_seconds` / `process_system_cpu_seconds` (cumulative), `process_threads`, and `process_context_switches_voluntary_total` / `process_context_switches_involuntary_total`. `process_cpu_usage_percent` alone says a process is using CPU, not *why*. These separate the three host-bound cases: CPU-saturated (user time climbing fast), blocked (voluntary switches climbing — I/O, a lock, a page fault), and starved of a core (involuntary switches climbing). When they point at a host problem, go to the CPU profiler section below for stacks.
 - Engine metrics scraped from Prometheus (vLLM `vllm:*`, SGLang `sglang:*`, TRT-LLM) appear under their original names. Both `histogram` and `summary` families become one Graphsignal histogram: exact `count`/`sum` always, plus `p50`/`p95` where the family exposes `le` buckets. llama.cpp appears as `llamacpp:*`; the dedicated launcher enables `llama-server --metrics` and derives the scrape host/port from `--host`/`--port` (defaults `127.0.0.1:8080`).
 - NInfer appears as `ninfer_*`: request latency distributions, token throughput, scheduler state, host/device-wait exposure, context-cache activity, transfers, pressure, and speculative-decoding acceptance. The dedicated launcher automatically enables NInfer's structured request log; no Prometheus endpoint or manual flag is required.
 - NInfer's benchmark harness (`ninfer_bench`) is profiled the same way, from its own report rather than the request log: wrap it as `graphsignal-run ninfer_bench <args> -o json --output-file <path>`. The report is imported as the same `ninfer_*` metrics with the test label as a `test` tag — `ninfer_request_decode_seconds{test: "tg128"}`, `ninfer_throughput_prefill_tokens_per_second{test: "pp2048"}`, `ninfer_speculative_acceptance_rate{test: "tg128", backend: "mtp"}` — plus run-scoped `bench.*` tags (model, kv_cache, speculative_backend, cuda_graph, repetitions) and the startup memory gauges. Two caveats: the harness writes the report as its last act before exiting, so read the metrics via the uploaded signals (an API key) rather than a local `/signals` curl after the run; and the report carries no bin grid, so its histograms have exact `count`/`sum`/`min`/`max` with `p50`/`p95` as `null` — compare `mean`, `min`, and `max`.
@@ -171,6 +174,20 @@ Then read `http://127.0.0.1:18259/signals` locally either way. On Linux, `docker
 
 Each read is the latest snapshot; trends come from diffing cumulative counts/sums between reads. When and how often to read is yours to decide — per benchmark run, per iteration, or continuously.
 
+### When the bottleneck is the CPU, not the GPU
+
+The profiler measures the host only as counters — CPU time split user/system, thread count, and the two context-switch counters. That is enough to tell a host-bound engine apart from a GPU-bound one, but it collects **no stacks**, by design: every stack-sampling mechanism on Linux (eBPF, `perf_event_open`, ptrace) needs privileges this profiler does not require, and adding that would break the contract the rest of this document depends on. So when the counters say the host is the problem, get the stacks from a tool that is allowed to ask for them:
+
+```bash
+py-spy dump --pid <pid>                                # Python engines: where it is right now
+py-spy record --pid <pid> --duration 30 --output profile.svg   # flamegraph
+perf record -F 99 -g --pid <pid> -- sleep 30           # native engines: full call graph
+perf script -i perf.data | stackcollapse-perf | flamegraph.pl > flame.svg
+bpftrace -e 'profile:hz:99 /pid == '"$PID"'/ { @[kstack] = count(); }'   # off-CPU, needs CAP_BPF
+```
+
+`py-spy` needs same-user access and a permissive `yama/ptrace_scope`; `perf` needs `perf_event_paranoid <= 1`; bpftrace needs `CAP_BPF`/`CAP_SYS_ADMIN`. **Graphsignal needs none of them** — keep it running underneath for the GPU and engine metrics while you take a one-off CPU profile beside it, rather than weakening the profiler's privilege story to get both from one tool.
+
 ## Overhead (and what it means for the numbers you report)
 
 Three collection modes, cheapest first. All three are privilege-free — none of them needs root, `CAP_SYS_ADMIN`, or a relaxed
@@ -181,6 +198,7 @@ Three collection modes, cheapest first. All three are privilege-free — none of
 | **Kernels** (default) | just `graphsignal-run` | on a GPU-bound workload, within run-to-run noise; a few percent at most on one that launches many small kernels per second | always, including long production runs |
 | **Graph node trace** | `--cuda-graph-trace node` | free on a GPU-bound workload; up to roughly ten percent on a host-bound one, because one record per replay becomes one per kernel inside it | to rank kernels in a graph-replaying engine, then switch back |
 | **GPU probes** | instrument the code | not measurable at production density (a few instruments per request/iteration); a few percent when dense enough to split one kernel into phases | **safe to ship in production**; dense instrumentation for investigation |
+| **CUDA API trace** | `GRAPHSIGNAL_CUDA_API_TRACE=1` | one CUPTI record per traced call; the default selection is a handful of APIs, `all` is a full API trace and costs like one | to find allocator churn or graph rebuild cost; investigation only |
 
 Overhead tracks how often the workload asks the driver to do something, not model size: an engine that replays a whole decode
 step as one CUDA graph has almost nothing to record, while one that launches thousands of small kernels pays per record.

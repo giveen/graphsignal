@@ -67,7 +67,7 @@ TEST_COMMON_OUT := $(BUILD_DIR)/common_test
 TEST_CUPTI_TEST_SRC := src/test/cupti/cupti_activity_test.cpp
 TEST_CUPTI_OUT := $(BUILD_DIR)/cupti_activity_test
 TEST_CUPTI_TEST_OBJ := $(BUILD_DIR)/cupti_activity_test.o
-TEST_CUPTI_OTHER_OBJ := $(BUILD_DIR)/cupti_activity.o
+TEST_CUPTI_OTHER_OBJ := $(BUILD_DIR)/cupti_activity.o $(BUILD_DIR)/nvtx_ranges.o
 TEST_NVTX_SRC := src/test/cupti/nvtx_ranges_test.cpp
 TEST_NVTX_OUT := $(BUILD_DIR)/nvtx_ranges_test
 # -rdynamic: the test executable defines the probe registry
@@ -273,6 +273,12 @@ $(TEST_CUPTI_OUT): $(TEST_CUPTI_TEST_OBJ) $(TEST_CUPTI_OTHER_OBJ) | $(BUILD_DIR)
 $(TEST_CUPTI_TEST_OBJ): $(TEST_CUPTI_TEST_SRC) | $(BUILD_DIR)
 	@echo "Compiling test file with nvcc: $@"
 	$(NVCC) $(NVCCFLAGS) -x cu -c -o "$@" $(TEST_CUPTI_TEST_SRC)
+
+# cupti_activity.cpp calls into the NVTX aggregator, so the test link needs
+# both translation units or it fails on undefined NvtxRangeAggregator symbols.
+$(BUILD_DIR)/nvtx_ranges.o: src/cupti/nvtx_ranges.cpp src/cupti/nvtx_ranges.h | $(BUILD_DIR)
+	@echo "Compiling: $@"
+	$(CXX) $(CXXFLAGS) $(CPPFLAGS) -c -o "$@" src/cupti/nvtx_ranges.cpp
 
 test-nvtx: $(TEST_NVTX_OUT)
 	@echo "Running test: $(TEST_NVTX_OUT)"
