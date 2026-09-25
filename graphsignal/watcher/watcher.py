@@ -65,6 +65,7 @@ class Watcher:
         self._api_key = api_key
         self._api_base = api_base
         self._tags = {}
+        self._tags_lock = threading.Lock()
         if tags:
             self._tags.update(tags)
 
@@ -94,6 +95,7 @@ class Watcher:
         self._recorders_lock = threading.Lock()
 
         self._target_terminated_event = threading.Event()
+        self._finalize_thread = None
         self._shutdown_started = False
         self._shutdown_lock = threading.Lock()
 
@@ -186,17 +188,20 @@ class Watcher:
         recorders.append(ShmRecorder(
             root_pid=self._target_pid, pid=self._target_pid, args=args))
 
-        # Extend (not replace): a LogRecorder registered earlier by
-        # on_target_known already lives in this list.
-        with self._recorders_lock:
-            self._global_recorders.extend(recorders)
-
+        active_recorders = []
         for recorder in recorders:
             try:
                 recorder.setup()
+                active_recorders.append(recorder)
             except Exception:
                 logger.error('Failed to set up recorder %s for target pid %s',
                              type(recorder).__name__, self._target_pid, exc_info=True)
+
+        # Extend (not replace): a LogRecorder registered earlier by
+        # on_target_known already lives in this list. Only recorders that
+        # completed setup become eligible for ticks and shutdown.
+        with self._recorders_lock:
+            self._global_recorders.extend(active_recorders)
 
     def on_child_created(self, pid, args):
         from graphsignal.recorders.process_recorder import ProcessRecorder
@@ -206,15 +211,16 @@ class Watcher:
             ProcessRecorder(root_pid=self._target_pid, pid=pid, args=args),
             ShmRecorder(root_pid=self._target_pid, pid=pid, args=args),
         ]
-        with self._recorders_lock:
-            self._child_recorders[pid] = recorders
-
+        active_recorders = []
         for recorder in recorders:
             try:
                 recorder.setup()
+                active_recorders.append(recorder)
             except Exception:
                 logger.error('Failed to set up recorder %s for child pid %s',
                              type(recorder).__name__, pid, exc_info=True)
+        with self._recorders_lock:
+            self._child_recorders[pid] = active_recorders
 
     def on_child_terminated(self, pid):
         with self._recorders_lock:
@@ -248,7 +254,11 @@ class Watcher:
             finally:
                 self._target_terminated_event.set()
 
-        threading.Thread(target=_finalize, daemon=True).start()
+        with self._shutdown_lock:
+            if self._finalize_thread is None:
+                self._finalize_thread = threading.Thread(
+                    target=_finalize, daemon=True, name='graphsignal-finalize')
+                self._finalize_thread.start()
 
     def _start_tick_timer(self):
         self._tick_stop_event = threading.Event()
@@ -286,6 +296,13 @@ class Watcher:
             if self._shutdown_started:
                 return
             self._shutdown_started = True
+
+        if self._finalize_thread:
+            try:
+                self._finalize_thread.join(timeout=5.0)
+            except Exception:
+                pass
+            self._finalize_thread = None
 
         if self._auto_tick:
             try:
@@ -344,7 +361,8 @@ class Watcher:
         self._log_store = None
         self._resource_store = None
 
-        self._tags = None
+        with self._tags_lock:
+            self._tags = None
 
         if self._python_log_handler:
             logger.removeHandler(self._python_log_handler)
@@ -379,9 +397,10 @@ class Watcher:
         yield from child_recs
 
     def tags(self) -> Dict[str, str]:
-        if self._tags is None:
-            return {}
-        return self._tags.copy()
+        with self._tags_lock:
+            if self._tags is None:
+                return {}
+            return self._tags.copy()
 
     def emit_tick(self):
         last_exc = None
@@ -398,31 +417,35 @@ class Watcher:
             logger.error('set_tag: key must be provided')
             return
 
-        if value is None:
-            self._tags.pop(key, None)
-            return
-
-        if len(self._tags) > Watcher.MAX_TAGS:
-            logger.error('set_tag: too many tags (>{0})'.format(Watcher.MAX_TAGS))
-            return
-
         if append_uuid:
             if not value:
                 value = uuid_sha1(size=12)
             else:
                 value = '{0}-{1}'.format(value, uuid_sha1(size=12))
 
-        self._tags[key] = value
+        with self._tags_lock:
+            if self._tags is None:
+                return
+            if value is None:
+                self._tags.pop(key, None)
+                return
+            if key not in self._tags and len(self._tags) >= Watcher.MAX_TAGS:
+                logger.error('set_tag: too many tags (>{0})'.format(Watcher.MAX_TAGS))
+                return
+            self._tags[key] = value
 
     def start_ns(self) -> int:
         """When this instance started, epoch nanoseconds."""
         return self._start_ns
 
     def get_tag(self, key: str) -> Optional[str]:
-        return self._tags.get(key, None)
+        with self._tags_lock:
+            return self._tags.get(key) if self._tags is not None else None
 
     def remove_tag(self, key: str) -> None:
-        self._tags.pop(key, None)
+        with self._tags_lock:
+            if self._tags is not None:
+                self._tags.pop(key, None)
 
     def set_gauge(self, name, value, measurement_ts, tags=None):
         self._metric_store.set_gauge(

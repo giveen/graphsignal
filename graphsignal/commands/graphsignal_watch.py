@@ -18,6 +18,16 @@ Usage:
 """
 
 
+def _port(value):
+    try:
+        port = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError('port must be an integer')
+    if not 1 <= port <= 65535:
+        raise argparse.ArgumentTypeError('port must be between 1 and 65535')
+    return port
+
+
 def main():
     parser = argparse.ArgumentParser(
         prog='graphsignal-watch',
@@ -26,7 +36,7 @@ def main():
     )
     parser.add_argument('--pid', type=int, required=True,
                         help='Target process PID to watch')
-    parser.add_argument('--metrics-port', type=int, default=None,
+    parser.add_argument('--metrics-port', type=_port, default=None,
                         help='Port to scrape the Prometheus metrics endpoint on')
     parser.add_argument('--metrics-path', type=str, default=None,
                         help='HTTP path for the Prometheus metrics endpoint '
@@ -38,7 +48,7 @@ def main():
                         help='Host to bind the /signals HTTP endpoint to '
                              '(default: 127.0.0.1; any other value exposes '
                              'the endpoint to that network)')
-    parser.add_argument('--listen-port', type=int, default=None,
+    parser.add_argument('--listen-port', type=_port, default=None,
                         help='Port for the local /signals HTTP endpoint '
                              '(default: 18259)')
     args = parser.parse_args()

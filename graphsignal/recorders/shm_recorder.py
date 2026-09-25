@@ -173,9 +173,9 @@ class ShmRecorder(BaseRecorder):
                 logger.debug('Skipping malformed metric entry in %s: %s',
                              filepath, name, exc_info=True)
 
-        self._log_entries(filepath, data.get('log'))
+        self._log_entries(watcher, filepath, data.get('log'))
 
-    def _log_entries(self, filepath, entries):
+    def _log_entries(self, watcher, filepath, entries):
         if not entries:
             return
         seen = self._seen_log_ts.setdefault(filepath, 0)
@@ -189,8 +189,20 @@ class ShmRecorder(BaseRecorder):
                     continue
                 max_ts = max(max_ts, ts)
                 msg = entry.get('msg', '')
-                if msg:
-                    logger.debug('workload: %s', str(msg).rstrip())
+                if not msg:
+                    continue
+                message = str(msg).rstrip()
+                level = entry.get('level')
+                if level in ('warning', 'error'):
+                    watcher.log_store().log_message(
+                        level=level,
+                        message=message,
+                        timestamp_ns=ts,
+                        tags={
+                            'process.pid': str(self.pid),
+                            'scope.name': 'profiler',
+                        })
+                logger.debug('workload: %s', message)
             self._seen_log_ts[filepath] = max_ts
         except Exception:
             pass

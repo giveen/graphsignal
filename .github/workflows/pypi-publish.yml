@@ -74,9 +74,7 @@ jobs:
         # NO `poetry update` here, deliberately. It resolves the newest
         # dependencies at release time, so the tests below would gate the
         # release against a set nobody has reviewed, and the artifact would be
-        # built against a lockfile mutated on a runner and thrown away. Catching
-        # dependency drift is daily-tests.yml's job, on its own schedule, where
-        # a break is a signal rather than a blocked release.
+        # built against a lockfile mutated on a runner and thrown away.
         run: poetry install
 
       - name: Run unit tests
@@ -87,7 +85,7 @@ jobs:
 
       - name: Check the wheel carries the prebuilt native libraries
         # The CUPTI and ROCm injection libraries are committed under
-        # graphsignal/_native/ and shipped by pyproject's `include`. A wheel
+        # graphsignal/_native/ and included by pyproject's native include. A wheel
         # without them installs cleanly, runs cleanly, and profiles no GPU at
         # all — the failure is silent and only visible on a GPU box, so it is
         # checked here rather than discovered there.
@@ -113,6 +111,21 @@ jobs:
           if len(names) < 5:
               sys.exit(f'::error::expected 5 native libraries, found {len(names)}')
           CHECK
+
+      - name: Check native library compatibility floor
+        run: |
+          for lib in graphsignal/_native/*/*.so; do
+            echo "Checking $lib"
+            # The shipped libraries currently top out at glibc 2.34 (ROCm);
+            # CUPTI is older. Refuse a rebuild that silently raises the wheel's
+            # load floor and breaks inference images built against the current one.
+            readelf --version-info "$lib" | python -c '
+            import re, sys
+            versions = {tuple(map(int, m.groups())) for m in re.finditer(r"GLIBC_(\d+)\.(\d+)", sys.stdin.read())}
+            if versions and max(versions) > (2, 34):
+                raise SystemExit("requires a newer glibc than the 2.34 release floor")
+            '
+          done
 
       - name: Publish to PyPI
         env:

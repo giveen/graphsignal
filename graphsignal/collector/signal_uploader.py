@@ -14,6 +14,8 @@ logger = logging.getLogger('graphsignal')
 
 class SignalUploader:
     MAX_BUFFER_SIZE = 10000
+    REQUEST_TIMEOUT_SEC = 10
+    SHUTDOWN_TIMEOUT_SEC = 2
 
     def __init__(self, api_key, api_base=None):
         self._api_key = api_key
@@ -44,7 +46,7 @@ class SignalUploader:
             if len(self._buffer) > self.MAX_BUFFER_SIZE:
                 self._buffer = self._buffer[-self.MAX_BUFFER_SIZE:]
 
-    def flush(self):
+    def flush(self, timeout=None):
         with self._flush_lock:
             with self._buffer_lock:
                 if len(self._buffer) == 0:
@@ -56,7 +58,7 @@ class SignalUploader:
                 upload_start = time.time()
 
                 upload_request = self._create_upload_request(outgoing)
-                self._post('api/v1/ingest', upload_request)
+                self._post('api/v1/ingest', upload_request, timeout=timeout)
 
                 logger.debug('Upload took %.3f sec', time.time() - upload_start)
             except Exception:
@@ -66,7 +68,7 @@ class SignalUploader:
                     if len(self._buffer) > self.MAX_BUFFER_SIZE:
                         self._buffer = self._buffer[-self.MAX_BUFFER_SIZE:]
 
-    def _post(self, endpoint, data):
+    def _post(self, endpoint, data, timeout=None):
         logger.debug('Posting data to %s/%s', self._api_base, endpoint)
 
         url = f"{self._api_base}/{endpoint}"
@@ -83,7 +85,7 @@ class SignalUploader:
                 url,
                 data=data_gzip,
                 headers=headers,
-                timeout=10
+                timeout=self.REQUEST_TIMEOUT_SEC if timeout is None else timeout
             )
             resp.raise_for_status()
             # requests automatically decompresses gzipped responses

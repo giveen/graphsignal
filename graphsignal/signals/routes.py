@@ -221,7 +221,8 @@ class SignalsEndpoint:
             return
 
         self._serve_thread = threading.Thread(
-            target=self._server.serve_forever, daemon=True)
+            target=lambda: self._server.serve_forever(poll_interval=0.05),
+            daemon=True)
         self._serve_thread.start()
         logger.debug('Signals endpoint listening on %s:%d', self._host, self._port)
 

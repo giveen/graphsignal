@@ -28,6 +28,8 @@ class NVMLRecorder(BaseRecorder):
         super().__init__(root_pid=root_pid, pid=pid, args=args)
         self._is_initialized: bool = False
         self._setup_us: Optional[int] = None
+        # Start of the last successfully read utilization window per device.
+        self._last_sample_start_us: Dict[int, int] = {}
         # Cumulative XID error totals per device index (counters carry totals).
         self._xid_error_totals: Dict[int, int] = {}
 
@@ -90,6 +92,10 @@ class NVMLRecorder(BaseRecorder):
         # Fallback to all visible devices if no current devices are set
         if len(self._current_device_idxs) == 0:
             self._current_device_idxs = self._visible_device_idxs.copy()
+
+        self._last_sample_start_us = {
+            idx: int(self._setup_us or 0) for idx in self._current_device_idxs
+        }
 
         self._setup_error_monitoring()
 
@@ -225,25 +231,33 @@ class NVMLRecorder(BaseRecorder):
                 _log_nvml_error(err)
 
             # nvmlDeviceGetSamples: average over the interval since the last
-            # read, floored at setup so a fresh run never reads another's window.
+            # successful read, floored at setup so a fresh run never reads
+            # another run's window. Keep the start per device so successive
+            # reads do not overlap and a clock rollback cannot rewind it.
+            sample_start_us = max(
+                self._last_sample_start_us.get(idx, int(self._setup_us or 0)),
+                now_us - NVMLRecorder.MIN_SAMPLE_READ_INTERVAL_US)
+            samples_succeeded = False
             try:
-                last_read_us = max(
-                    int(self._setup_us or 0),
-                    now_us - NVMLRecorder.MIN_SAMPLE_READ_INTERVAL_US)
-
                 sample_value_type, gpu_samples = nvmlDeviceGetSamples(
-                    handle, NVML_GPU_UTILIZATION_SAMPLES, last_read_us)
+                    handle, NVML_GPU_UTILIZATION_SAMPLES, sample_start_us)
                 gpu_utilization = _avg_sample_value(sample_value_type, gpu_samples)
                 if gpu_utilization > 0:
                     gauge('gpu_utilization_percent', gpu_utilization)
 
                 sample_value_type, mem_samples = nvmlDeviceGetSamples(
-                    handle, NVML_MEMORY_UTILIZATION_SAMPLES, last_read_us)
+                    handle, NVML_MEMORY_UTILIZATION_SAMPLES, sample_start_us)
                 memory_utilization = _avg_sample_value(sample_value_type, mem_samples)
                 if memory_utilization > 0:
                     gauge('gpu_memory_utilization_percent', memory_utilization)
+                samples_succeeded = True
             except Exception as err:
                 _log_nvml_error(err)
+
+            if samples_succeeded:
+                # now_us is the end of this window. max() also protects the
+                # next window if the wall clock moves backwards.
+                self._last_sample_start_us[idx] = max(sample_start_us, now_us)
 
             # nvmlDeviceGetTemperature
             try:

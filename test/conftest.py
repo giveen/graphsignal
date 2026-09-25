@@ -29,13 +29,9 @@ def pytest_runtest_protocol(item, nextitem):
     ihook.pytest_runtest_logstart(nodeid=item.nodeid, location=item.location)
 
     env = {**os.environ, _CUDA_SUBPROCESS_VAR: "1"}
-    # `test_cupti_recorder.py`'s module-level `CuptiProfiler.setup_env_vars()`
-    # leaves `CUDA_INJECTION64_PATH` set on the parent pytest process. Other
-    # cuda-marked tests (e.g. NVML) must not inherit it — loading the CUPTI
-    # injection library into a process that already has the SDK running
-    # crashes inside the CUDA driver init. Strip the env var here; tests that
-    # do want the injection (the CUPTI tests themselves) re-set it at module
-    # import inside their own subprocess.
+    # Keep the subprocess independent from any CUPTI injection path inherited
+    # from the parent test process. Tests that need the injection set it inside
+    # their own subprocess.
     env.pop('CUDA_INJECTION64_PATH', None)
     proc = subprocess.run(
         [sys.executable, "-m", "pytest", item.nodeid,

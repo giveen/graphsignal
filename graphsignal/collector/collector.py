@@ -51,7 +51,7 @@ class Collector:
             logger.error('Error collecting signals for upload', exc_info=True)
 
     def shutdown(self):
-        self._uploader.flush()
+        self._uploader.flush(timeout=SignalUploader.SHUTDOWN_TIMEOUT_SEC)
 
     def _collect_metrics(self, metric_store, global_tags):
         snapshot = metric_store.export()

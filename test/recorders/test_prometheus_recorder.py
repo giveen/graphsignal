@@ -1,3 +1,5 @@
+import threading
+import time
 import unittest
 from unittest.mock import patch
 
@@ -104,6 +106,9 @@ class PrometheusRecorderScrapeTest(unittest.TestCase):
 
     def _tick(self, recorder, body):
         with patch.object(recorder, '_fetch_metrics', return_value=body) as fetch_m:
+            recorder.on_tick()
+            if recorder._fetch_thread is not None:
+                recorder._fetch_thread.join(timeout=1)
             recorder.on_tick()
         return fetch_m
 
@@ -261,6 +266,9 @@ sglang:gen_throughput 12.5
                           return_value='<html>nope</html>'), \
              patch.object(recorder, '_parse_and_emit') as parse_m:
             recorder.on_tick()
+            if recorder._fetch_thread is not None:
+                recorder._fetch_thread.join(timeout=1)
+            recorder.on_tick()
         parse_m.assert_not_called()
         self.assertFalse(recorder._verified)
 
@@ -269,7 +277,32 @@ sglang:gen_throughput 12.5
         with patch.object(recorder, '_fetch_metrics',
                           side_effect=OSError('refused')):
             recorder.on_tick()  # must not raise
+            if recorder._fetch_thread is not None:
+                recorder._fetch_thread.join(timeout=1)
+            recorder.on_tick()  # consume the background failure
         self.assertFalse(recorder._verified)
+
+    def test_slow_fetch_does_not_block_tick_or_start_overlap(self):
+        recorder = _recorder(metrics_port=8000)
+        started = threading.Event()
+        release = threading.Event()
+
+        def slow_fetch(url):
+            started.set()
+            release.wait(timeout=2)
+            return _GAUGE_BODY % '1.0'
+
+        with patch.object(recorder, '_fetch_metrics', side_effect=slow_fetch) as fetch_m:
+            start = time.monotonic()
+            recorder.on_tick()
+            self.assertLess(time.monotonic() - start, 0.1)
+            self.assertTrue(started.wait(timeout=1))
+            recorder.on_tick()
+            fetch_m.assert_called_once()
+
+            release.set()
+            recorder._fetch_thread.join(timeout=1)
+            recorder.on_tick()
 
 
 if __name__ == '__main__':

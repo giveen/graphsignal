@@ -1,8 +1,11 @@
 import unittest
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 import pytest
 
 import graphsignal.watcher
+import graphsignal.recorders.nvml_recorder as nvml_module
 from graphsignal.recorders.nvml_recorder import NVMLRecorder
 from test.test_utils import configure_test_watcher, find_metric
 
@@ -26,6 +29,48 @@ def has_torch() -> bool:
         return False
 
 
+def _mocked_nvml(sample_reads, fail_memory=False):
+    """Patch the NVML surface used by setup and one sampling tick."""
+    def get_samples(handle, sample_type, start_us):
+        sample_reads.append((sample_type, start_us))
+        if fail_memory and sample_type == nvml_module.NVML_MEMORY_UTILIZATION_SAMPLES:
+            raise RuntimeError('memory samples unavailable')
+        return nvml_module.NVML_VALUE_TYPE_UNSIGNED_INT, []
+
+    return patch.multiple(nvml_module, create=True, **{
+        'nvmlInit': Mock(),
+        'nvmlDeviceGetCount': Mock(return_value=1),
+        'nvmlDeviceGetHandleByIndex': Mock(return_value=object()),
+        'nvmlEventSetCreate': Mock(return_value=object()),
+        'nvmlDeviceRegisterEvents': Mock(),
+        'nvmlEventSetFree': Mock(),
+        'nvmlShutdown': Mock(),
+        'nvmlDeviceGetPciInfo_v3': Mock(return_value=SimpleNamespace(busId='bus')),
+        'nvmlDeviceGetUUID': Mock(return_value='uuid'),
+        'nvmlDeviceGetMemoryInfo_v2': Mock(return_value=SimpleNamespace(
+            reserved=0, total=1, used=0, free=1)),
+        'nvmlDeviceGetSamples': Mock(side_effect=get_samples),
+        'nvmlDeviceGetTemperature': Mock(return_value=0),
+        'nvmlDeviceGetPowerUsage': Mock(return_value=0),
+        'nvmlDeviceGetPowerManagementLimit': Mock(return_value=0),
+        'nvmlDeviceGetFanSpeed': Mock(return_value=0),
+        'nvmlDeviceGetClockInfo': Mock(return_value=0),
+        'nvmlDeviceGetMaxClockInfo': Mock(return_value=0),
+        'nvmlDeviceGetCurrentClocksThrottleReasons': Mock(return_value=0),
+        'nvmlDeviceGetPerformanceState': Mock(return_value=0),
+        'nvmlDeviceGetPcieThroughput': Mock(return_value=0),
+        'nvmlDeviceGetCurrPcieLinkGeneration': Mock(return_value=0),
+        'nvmlDeviceGetCurrPcieLinkWidth': Mock(return_value=0),
+        'nvmlDeviceGetPcieReplayCounter': Mock(return_value=0),
+        'nvmlDeviceGetFieldValues': Mock(return_value=[]),
+        'nvmlDeviceGetNvLinkState': Mock(side_effect=RuntimeError('not supported')),
+        'nvmlDeviceGetTotalEccErrors': Mock(return_value=0),
+        'nvmlDeviceGetName': Mock(return_value='GPU'),
+        'nvmlDeviceGetArchitecture': Mock(return_value=1),
+        'nvmlDeviceGetCudaComputeCapability': Mock(return_value=(1, 0)),
+    })
+
+
 class NVMLRecorderTest(unittest.TestCase):
     def setUp(self):
         self.watcher = configure_test_watcher()
@@ -42,6 +87,53 @@ class NVMLRecorderTest(unittest.TestCase):
 
         self.assertEqual(self.watcher.metric_store().export(), [])
         recorder.shutdown()
+
+    def test_sample_windows_start_at_setup_and_advance_without_overlap(self):
+        sample_reads = []
+        with _mocked_nvml(sample_reads):
+            with patch.object(nvml_module.time, 'time', return_value=100.0), \
+                    patch.object(nvml_module.time, 'time_ns', return_value=100_000_000_000):
+                recorder = NVMLRecorder()
+                recorder.setup()
+                self.assertEqual(recorder._last_sample_start_us, {0: 100_000_000})
+
+            with patch.object(nvml_module.time, 'time', return_value=101.0), \
+                    patch.object(nvml_module.time, 'time_ns', return_value=101_000_000_000):
+                recorder.on_tick()
+            with patch.object(nvml_module.time, 'time', return_value=102.0), \
+                    patch.object(nvml_module.time, 'time_ns', return_value=102_000_000_000):
+                recorder.on_tick()
+            with patch.object(nvml_module.time, 'time', return_value=100.5), \
+                    patch.object(nvml_module.time, 'time_ns', return_value=100_500_000_000):
+                recorder.on_tick()
+
+            self.assertEqual(
+                sample_reads,
+                [
+                    (nvml_module.NVML_GPU_UTILIZATION_SAMPLES, 100_000_000),
+                    (nvml_module.NVML_MEMORY_UTILIZATION_SAMPLES, 100_000_000),
+                    (nvml_module.NVML_GPU_UTILIZATION_SAMPLES, 101_000_000),
+                    (nvml_module.NVML_MEMORY_UTILIZATION_SAMPLES, 101_000_000),
+                    (nvml_module.NVML_GPU_UTILIZATION_SAMPLES, 102_000_000),
+                    (nvml_module.NVML_MEMORY_UTILIZATION_SAMPLES, 102_000_000),
+                ])
+            self.assertEqual(recorder._last_sample_start_us[0], 102_000_000)
+            recorder.shutdown()
+
+    def test_failed_sample_pair_does_not_advance_or_rewind_window(self):
+        sample_reads = []
+        with _mocked_nvml(sample_reads, fail_memory=True):
+            with patch.object(nvml_module.time, 'time', return_value=100.0), \
+                    patch.object(nvml_module.time, 'time_ns', return_value=100_000_000_000):
+                recorder = NVMLRecorder()
+                recorder.setup()
+                recorder.on_tick()
+
+            self.assertEqual(recorder._last_sample_start_us[0], 100_000_000)
+            self.assertEqual(
+                [start_us for _, start_us in sample_reads],
+                [100_000_000, 100_000_000])
+            recorder.shutdown()
 
     @pytest.mark.cuda
     def test_record(self):

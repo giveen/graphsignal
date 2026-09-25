@@ -17,6 +17,7 @@ class PidMonitor:
         self._stop_event = threading.Event()
         self._thread = None
         self._target_seen = False
+        self._target_create_time = None
         self._terminated_emitted = False
 
     def add_listener(self, listener):
@@ -72,6 +73,20 @@ class PidMonitor:
             return
 
         if not alive:
+            self._emit_terminated()
+            return
+
+        try:
+            create_time = proc.create_time()
+        except psutil.NoSuchProcess:
+            self._emit_terminated()
+            return
+        except psutil.Error:
+            return
+
+        if self._target_create_time is None:
+            self._target_create_time = create_time
+        elif create_time != self._target_create_time:
             self._emit_terminated()
             return
 

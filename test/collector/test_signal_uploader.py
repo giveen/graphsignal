@@ -14,7 +14,7 @@ def _metric_proto():
     metric.type = signals_pb2.Metric.MetricType.GAUGE_METRIC
     dp = metric.datapoints.add()
     dp.gauge = 42.0
-    dp.measurement_ts = int(time.time())
+    dp.measurement_ts = time.time_ns()
     return metric
 
 
@@ -29,8 +29,18 @@ class SignalUploaderTest(unittest.TestCase):
         uploader.upload_metric(_metric_proto())
         uploader.flush()
 
-        mocked_post.assert_called_once()
+        mocked_post.assert_called_once_with(
+            'api/v1/ingest', mocked_post.call_args.args[1], timeout=None)
         self.assertEqual(len(uploader._buffer), 0)
+
+    @patch.object(SignalUploader, '_post')
+    def test_flush_passes_explicit_timeout(self, mocked_post):
+        uploader = SignalUploader('k1')
+        uploader.upload_metric(_metric_proto())
+
+        uploader.flush(timeout=0.25)
+
+        self.assertEqual(mocked_post.call_args.kwargs['timeout'], 0.25)
 
     @patch.object(SignalUploader, '_post')
     def test_flush_failure_rebuffers(self, mocked_post):
@@ -82,12 +92,14 @@ class SignalUploaderTest(unittest.TestCase):
         server.join(timeout=2.0)
 
         self.assertEqual(request_path, '/api/v1/ingest')
+        self.assertIsNotNone(request_data, 'uploader did not post a request')
 
         upload_request = signals_pb2.UploadRequest()
         upload_request.ParseFromString(request_data)
 
         self.assertGreater(upload_request.upload_ts, 0)
 
+        self.assertIsNotNone(request_data, 'uploader did not post a request')
         self.assertEqual(len(upload_request.metrics), 1)
         self.assertEqual(upload_request.metrics[0].name, 'metric1')
         self.assertEqual(len(upload_request.metrics[0].datapoints), 1)

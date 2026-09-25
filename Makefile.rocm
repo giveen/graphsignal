@@ -42,7 +42,7 @@ ROCM_LIB_DIR ?= $(shell \
 
 # ---------------- Toolchain ----------------
 CXX ?= g++
-CXXFLAGS ?= -O2 -fPIC -std=c++17
+CXXFLAGS ?= -O2 -fPIC -std=c++17 -Wall -Wextra
 # __HIP_PLATFORM_AMD__ is REQUIRED: the rocprofiler-sdk headers transitively
 # include the HIP runtime headers, which #error out unless exactly one of
 # __HIP_PLATFORM_AMD__ / __HIP_PLATFORM_NVIDIA__ is defined. hipcc defines it
